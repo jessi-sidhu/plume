@@ -13,3 +13,4 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }

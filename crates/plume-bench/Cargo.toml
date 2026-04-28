@@ -18,6 +18,9 @@ duckdb = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "gen_fixtures"
 path = "src/bin/gen_fixtures.rs"

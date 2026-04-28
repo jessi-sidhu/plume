@@ -7,9 +7,13 @@
 //! float-NaN, dictionary encoding, and schema-metadata noise. Order matters by
 //! default — pass `order_sensitive = false` if your query has no ORDER BY.
 
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
+use arrow_schema::Schema;
+use parquet::arrow::ArrowWriter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
@@ -132,4 +136,17 @@ pub fn assert_matches_duckdb(
         );
     }
     Ok(())
+}
+
+/// Write a single batch to a fresh Parquet file inside `dir`. Returns the
+/// path. Used by Week-3 evaluator tests that need DuckDB to see the same
+/// input the plume evaluator just consumed.
+pub fn write_batch_parquet(dir: &Path, name: &str, batch: &RecordBatch) -> Result<PathBuf> {
+    let path = dir.join(format!("{name}.parquet"));
+    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    let schema: Arc<Schema> = batch.schema();
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(batch)?;
+    writer.close()?;
+    Ok(path)
 }

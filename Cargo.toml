@@ -26,7 +26,7 @@ arrow-select = "54"
 parquet = { version = "54", features = ["arrow"] }
 anyhow = "1"
 thiserror = "1"
-duckdb = { version = "1", features = ["bundled"] }
+duckdb = { version = "1", features = ["bundled", "parquet"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 
