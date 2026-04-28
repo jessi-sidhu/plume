@@ -12,7 +12,7 @@ pub mod exec;
 pub mod operators;
 pub mod planner;
 
-pub use aggregate::{Accumulator, AggregateExec};
+pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
 pub use exec::{BatchStream, ExecutionPlan};
 pub use operators::{CsvScanExec, FilterExec, LimitExec, MemoryExec, ProjectionExec};

@@ -102,18 +102,6 @@ fn limit_exec_caps_total_rows_across_batch_boundaries() {
 }
 
 #[test]
-fn planner_rejects_grouped_aggregate_for_now() {
-    // GROUP BY is HashAggregateExec, Week 6.
-    let df = plume_core::DataFrame::scan_csv("ignored", schema())
-        .aggregate(vec![col("name")], vec![plume_core::sum(col("age"))])
-        .unwrap();
-    match create_physical_plan(&df.into_plan()) {
-        Err(plume_exec::EvalError::NotImplemented(_)) => {}
-        other => panic!("expected NotImplemented, got {other:?}", other = other.err()),
-    }
-}
-
-#[test]
 fn planner_rejects_parquet_scan_for_now() {
     let df = plume_core::DataFrame::scan_parquet("nope.parquet", schema());
     match create_physical_plan(&df.into_plan()) {

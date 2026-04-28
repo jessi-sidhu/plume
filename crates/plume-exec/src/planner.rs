@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use plume_core::{LogicalPlan, ScanSource};
 
-use crate::aggregate::AggregateExec;
+use crate::aggregate::{AggregateExec, HashAggregateExec};
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::ExecutionPlan;
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ProjectionExec};
@@ -37,13 +37,17 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
             Arc::new(LimitExec::new(child, *n))
         }
         LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema } => {
-            if !group_exprs.is_empty() {
-                return Err(EvalError::NotImplemented(
-                    "GROUP BY (HashAggregateExec) lands in Week 6".into(),
-                ));
-            }
             let child = create_physical_plan(input)?;
-            Arc::new(AggregateExec::new(child, agg_exprs.clone(), schema.clone()))
+            if group_exprs.is_empty() {
+                Arc::new(AggregateExec::new(child, agg_exprs.clone(), schema.clone()))
+            } else {
+                Arc::new(HashAggregateExec::new(
+                    child,
+                    group_exprs.clone(),
+                    agg_exprs.clone(),
+                    schema.clone(),
+                ))
+            }
         }
     })
 }
