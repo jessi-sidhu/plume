@@ -11,6 +11,7 @@ use arrow::compute::filter_record_batch;
 use arrow::csv;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use plume_core::Expr;
 
 use crate::eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
@@ -46,6 +47,36 @@ impl ExecutionPlan for CsvScanExec {
         // Map the error type into ours.
         let mapped = reader.map(|r| r.map_err(EvalError::from));
         Ok(Box::new(mapped))
+    }
+}
+
+// ---- Parquet scan ------------------------------------------------------
+
+pub struct ParquetScanExec {
+    path: PathBuf,
+    schema: SchemaRef,
+    batch_size: usize,
+}
+
+impl ParquetScanExec {
+    pub fn new(path: PathBuf, schema: SchemaRef) -> Self {
+        Self { path, schema, batch_size: DEFAULT_BATCH_SIZE }
+    }
+}
+
+impl ExecutionPlan for ParquetScanExec {
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+
+    fn execute(&self) -> EvalResult<BatchStream> {
+        let file = File::open(&self.path)?;
+        // For Week 7 we read every column and every row group. Column pruning
+        // (W8) and row-group pruning (W9) plug into this builder via
+        // .with_projection(ProjectionMask) and .with_row_groups(Vec<usize>).
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_batch_size(self.batch_size)
+            .build()?;
+        // Reader yields Result<RecordBatch, ParquetError>; map into our error.
+        Ok(Box::new(reader.map(|r| r.map_err(EvalError::from))))
     }
 }
 

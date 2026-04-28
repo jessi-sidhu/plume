@@ -10,18 +10,16 @@ use arrow_array::RecordBatch;
 use plume_core::{LogicalPlan, ScanSource};
 
 use crate::aggregate::{AggregateExec, HashAggregateExec};
-use crate::eval::{EvalError, EvalResult};
+use crate::eval::EvalResult;
 use crate::exec::ExecutionPlan;
-use crate::operators::{CsvScanExec, FilterExec, LimitExec, ProjectionExec};
+use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
     Ok(match plan {
         LogicalPlan::Scan { source, schema } => match source {
             ScanSource::Csv { path } => Arc::new(CsvScanExec::new(path.clone(), schema.clone())),
-            ScanSource::Parquet { .. } => {
-                return Err(EvalError::NotImplemented(
-                    "Parquet scan lands in Week 7".into(),
-                ));
+            ScanSource::Parquet { path } => {
+                Arc::new(ParquetScanExec::new(path.clone(), schema.clone()))
             }
         },
         LogicalPlan::Filter { input, predicate, .. } => {

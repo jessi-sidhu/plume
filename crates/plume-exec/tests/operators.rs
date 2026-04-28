@@ -9,8 +9,7 @@ use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use plume_core::{col, lit};
 use plume_exec::{
-    collect, create_physical_plan, ExecutionPlan, FilterExec, LimitExec, MemoryExec,
-    ProjectionExec,
+    collect, ExecutionPlan, FilterExec, LimitExec, MemoryExec, ProjectionExec,
 };
 
 fn schema() -> SchemaRef {
@@ -99,15 +98,6 @@ fn limit_exec_caps_total_rows_across_batch_boundaries() {
     // First batch full (2 rows); second trimmed to 1.
     assert_eq!(out[0].num_rows(), 2);
     assert_eq!(out[1].num_rows(), 1);
-}
-
-#[test]
-fn planner_rejects_parquet_scan_for_now() {
-    let df = plume_core::DataFrame::scan_parquet("nope.parquet", schema());
-    match create_physical_plan(&df.into_plan()) {
-        Err(plume_exec::EvalError::NotImplemented(_)) => {}
-        other => panic!("expected NotImplemented, got {other:?}", other = other.err()),
-    }
 }
 
 #[test]

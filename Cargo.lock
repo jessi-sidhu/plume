@@ -1128,6 +1128,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "parquet",
  "plume-core",
  "tempfile",
  "thiserror",

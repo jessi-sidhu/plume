@@ -15,5 +15,7 @@ pub mod planner;
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
 pub use exec::{BatchStream, ExecutionPlan};
-pub use operators::{CsvScanExec, FilterExec, LimitExec, MemoryExec, ProjectionExec};
+pub use operators::{
+    CsvScanExec, FilterExec, LimitExec, MemoryExec, ParquetScanExec, ProjectionExec,
+};
 pub use planner::{collect, create_physical_plan};

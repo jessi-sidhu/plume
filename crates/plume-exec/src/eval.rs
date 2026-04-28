@@ -38,6 +38,8 @@ pub enum EvalError {
     PredicateNotBoolean(DataType),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
 }
