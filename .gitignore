@@ -1,0 +1,9 @@
+/target
+Cargo.lock.bak
+*.flamegraph
+perf.data*
+.DS_Store
+
+# Generated fixtures are large; rebuild via `cargo run -p plume-bench --bin gen_fixtures`.
+/fixtures/*.csv
+/fixtures/*.parquet

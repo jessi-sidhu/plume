@@ -1,0 +1,23 @@
+[package]
+name = "plume-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+plume-core = { workspace = true }
+plume-exec = { workspace = true }
+plume-io = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+duckdb = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+
+[[bin]]
+name = "gen_fixtures"
+path = "src/bin/gen_fixtures.rs"

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/plume-core",
+    "crates/plume-exec",
+    "crates/plume-optimizer",
+    "crates/plume-io",
+    "crates/plume-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+publish = false
+
+# Pin Arrow + Parquet to the same minor (they must match).
+# duckdb crate version is selected to be compatible with this Arrow line;
+# if the resolver complains, bump the trio together.
+[workspace.dependencies]
+arrow = "54"
+arrow-array = "54"
+arrow-schema = "54"
+arrow-select = "54"
+parquet = { version = "54", features = ["arrow"] }
+anyhow = "1"
+thiserror = "1"
+duckdb = { version = "1", features = ["bundled"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+plume-core = { path = "crates/plume-core" }
+plume-exec = { path = "crates/plume-exec" }
+plume-optimizer = { path = "crates/plume-optimizer" }
+plume-io = { path = "crates/plume-io" }
+
+[profile.release]
+debug = true        # keep symbols for flamegraphs
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true
