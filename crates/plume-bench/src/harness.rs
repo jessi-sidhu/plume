@@ -40,12 +40,13 @@ fn render_cell(array: &dyn Array, i: usize) -> Result<String> {
         DataType::UInt16 => array.as_primitive::<UInt16Type>().value(i).to_string(),
         DataType::UInt32 => array.as_primitive::<UInt32Type>().value(i).to_string(),
         DataType::UInt64 => array.as_primitive::<UInt64Type>().value(i).to_string(),
-        // Floats: 10 decimals for f64 / 5 for f32. f64 has ~15-17 sig digits,
-        // but a 1M-row SUM loses ~6 bits of precision to summation order
-        // alone (engine-dependent). 10 decimals is below the agreement
-        // threshold without making "near misses" indistinguishable.
-        DataType::Float32 => format!("{:.5}", array.as_primitive::<Float32Type>().value(i)),
-        DataType::Float64 => format!("{:.10}", array.as_primitive::<Float64Type>().value(i)),
+        // Floats: scientific with ~10 significant digits. Fixed-decimal
+        // formats penalize whichever side is bigger (a 4-decimal AVG of 500
+        // resolves to ~7 sig figs but the same 4 decimals of 0.0007 is just
+        // 1 sig fig). Sig-figs is the only fair scale across magnitudes,
+        // and 10 sig figs survives 1M-row SUM/AVG drift between engines.
+        DataType::Float32 => format!("{:.5e}", array.as_primitive::<Float32Type>().value(i)),
+        DataType::Float64 => format!("{:.9e}", array.as_primitive::<Float64Type>().value(i)),
         DataType::Utf8 => array.as_string::<i32>().value(i).to_string(),
         DataType::LargeUtf8 => array.as_string::<i64>().value(i).to_string(),
         // DuckDB returns SUM(integer) as DECIMAL(38,0) by default; render as

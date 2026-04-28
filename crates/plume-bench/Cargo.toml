@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 plume-core = { workspace = true }
 plume-exec = { workspace = true }
+plume-optimizer = { workspace = true }
 plume-io = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

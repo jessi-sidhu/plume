@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 plume-core = { workspace = true }
+arrow-schema = { workspace = true }

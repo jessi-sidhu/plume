@@ -23,14 +23,58 @@ const DEFAULT_BATCH_SIZE: usize = 8192;
 
 pub struct CsvScanExec {
     path: PathBuf,
+    /// Output schema. When `projection` is `Some`, this is the file schema
+    /// restricted to (and reordered by) those columns.
     schema: SchemaRef,
+    /// Indices into the file's full schema, when set by the optimizer.
+    /// `None` = read every column.
+    projection: Option<Vec<usize>>,
+    /// File's full schema. Required so arrow's CSV reader can parse every
+    /// row in source order before the projection narrows it.
+    file_schema: SchemaRef,
     batch_size: usize,
     has_header: bool,
 }
 
 impl CsvScanExec {
     pub fn new(path: PathBuf, schema: SchemaRef) -> Self {
-        Self { path, schema, batch_size: DEFAULT_BATCH_SIZE, has_header: true }
+        Self {
+            path,
+            schema: schema.clone(),
+            projection: None,
+            file_schema: schema,
+            batch_size: DEFAULT_BATCH_SIZE,
+            has_header: true,
+        }
+    }
+
+    /// Construct with a projection. `file_schema` is the unprojected schema
+    /// of the source file; `projected_columns` are the names to keep.
+    pub fn with_projection(
+        path: PathBuf,
+        file_schema: SchemaRef,
+        projected_columns: &[String],
+    ) -> EvalResult<Self> {
+        let mut indices = Vec::with_capacity(projected_columns.len());
+        let mut fields = Vec::with_capacity(projected_columns.len());
+        for name in projected_columns {
+            let idx = file_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .ok_or_else(|| EvalError::MissingColumn(name.clone()))?;
+            indices.push(idx);
+            fields.push((*file_schema.field(idx)).clone());
+        }
+        let projected_schema = Arc::new(arrow_schema::Schema::new(fields));
+        Ok(Self {
+            path,
+            schema: projected_schema,
+            projection: Some(indices),
+            file_schema,
+            batch_size: DEFAULT_BATCH_SIZE,
+            has_header: true,
+        })
     }
 }
 
@@ -39,12 +83,13 @@ impl ExecutionPlan for CsvScanExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let file = File::open(&self.path)?;
-        let reader = csv::ReaderBuilder::new(self.schema.clone())
+        let mut builder = csv::ReaderBuilder::new(self.file_schema.clone())
             .with_header(self.has_header)
-            .with_batch_size(self.batch_size)
-            .build(file)?;
-        // arrow's CSV Reader is Iterator<Item = Result<RecordBatch, ArrowError>>.
-        // Map the error type into ours.
+            .with_batch_size(self.batch_size);
+        if let Some(indices) = &self.projection {
+            builder = builder.with_projection(indices.clone());
+        }
+        let reader = builder.build(file)?;
         let mapped = reader.map(|r| r.map_err(EvalError::from));
         Ok(Box::new(mapped))
     }
@@ -55,12 +100,30 @@ impl ExecutionPlan for CsvScanExec {
 pub struct ParquetScanExec {
     path: PathBuf,
     schema: SchemaRef,
+    /// Column names to project, in output order. None = read every column.
+    /// We intentionally store names rather than precomputed indices: the
+    /// parquet schema and ProjectionMask live behind the file metadata,
+    /// which we re-read on every execute() call.
+    projection: Option<Vec<String>>,
     batch_size: usize,
 }
 
 impl ParquetScanExec {
     pub fn new(path: PathBuf, schema: SchemaRef) -> Self {
-        Self { path, schema, batch_size: DEFAULT_BATCH_SIZE }
+        Self { path, schema, projection: None, batch_size: DEFAULT_BATCH_SIZE }
+    }
+
+    pub fn with_projection(
+        path: PathBuf,
+        projected_schema: SchemaRef,
+        projected_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            path,
+            schema: projected_schema,
+            projection: Some(projected_columns),
+            batch_size: DEFAULT_BATCH_SIZE,
+        }
     }
 }
 
@@ -69,13 +132,29 @@ impl ExecutionPlan for ParquetScanExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let file = File::open(&self.path)?;
-        // For Week 7 we read every column and every row group. Column pruning
-        // (W8) and row-group pruning (W9) plug into this builder via
-        // .with_projection(ProjectionMask) and .with_row_groups(Vec<usize>).
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_batch_size(self.batch_size)
-            .build()?;
-        // Reader yields Result<RecordBatch, ParquetError>; map into our error.
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_batch_size(self.batch_size);
+        let reader = match &self.projection {
+            None => builder.build()?,
+            Some(cols) => {
+                // Map column names to root-level indices in the parquet schema,
+                // then build a ProjectionMask. Names that aren't in the file
+                // surface as MissingColumn.
+                let parquet_schema = builder.parquet_schema();
+                let root = parquet_schema.root_schema();
+                let mut indices = Vec::with_capacity(cols.len());
+                for name in cols {
+                    let idx = root
+                        .get_fields()
+                        .iter()
+                        .position(|f| f.name() == name)
+                        .ok_or_else(|| EvalError::MissingColumn(name.clone()))?;
+                    indices.push(idx);
+                }
+                let mask = parquet::arrow::ProjectionMask::roots(parquet_schema, indices);
+                builder.with_projection(mask).build()?
+            }
+        };
         Ok(Box::new(reader.map(|r| r.map_err(EvalError::from))))
     }
 }

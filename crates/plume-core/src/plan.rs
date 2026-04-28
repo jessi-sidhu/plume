@@ -44,7 +44,13 @@ impl ScanSource {
 pub enum LogicalPlan {
     Scan {
         source: ScanSource,
+        /// Output schema. When `projection` is `None` this is the full file
+        /// schema; when `Some(cols)` it is the file schema restricted to and
+        /// reordered by `cols`. Always reflects what downstream operators see.
         schema: SchemaRef,
+        /// Set by the column-pruning optimizer (Week 8). `None` = read every
+        /// column. `Some(names)` = read just these, in this order.
+        projection: Option<Vec<String>>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -84,11 +90,44 @@ impl LogicalPlan {
     // ---- constructors that enforce schema propagation rules ---------------
 
     pub fn scan_csv(path: impl Into<PathBuf>, schema: SchemaRef) -> Self {
-        LogicalPlan::Scan { source: ScanSource::Csv { path: path.into() }, schema }
+        LogicalPlan::Scan {
+            source: ScanSource::Csv { path: path.into() },
+            schema,
+            projection: None,
+        }
     }
 
     pub fn scan_parquet(path: impl Into<PathBuf>, schema: SchemaRef) -> Self {
-        LogicalPlan::Scan { source: ScanSource::Parquet { path: path.into() }, schema }
+        LogicalPlan::Scan {
+            source: ScanSource::Parquet { path: path.into() },
+            schema,
+            projection: None,
+        }
+    }
+
+    /// Construct a Scan with column projection already applied. `schema` must
+    /// be the full file schema; we restrict it to and reorder it by `cols`.
+    /// Used by the column-pruning optimizer.
+    pub fn scan_with_projection(
+        source: ScanSource,
+        full_schema: SchemaRef,
+        cols: Vec<String>,
+    ) -> Result<Self> {
+        let mut fields = Vec::with_capacity(cols.len());
+        for name in &cols {
+            let f = full_schema
+                .field_with_name(name)
+                .map_err(|_| PlumeError::Schema(format!(
+                    "scan_with_projection: column `{name}` not in source schema"
+                )))?;
+            fields.push(f.clone());
+        }
+        let projected_schema = Arc::new(Schema::new(fields));
+        Ok(LogicalPlan::Scan {
+            source,
+            schema: projected_schema,
+            projection: Some(cols),
+        })
     }
 
     pub fn filter(input: LogicalPlan, predicate: Expr) -> Result<Self> {
@@ -167,14 +206,23 @@ fn is_aggregate_expr(e: &Expr) -> bool {
 fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Result {
     let pad = "  ".repeat(depth);
     match plan {
-        LogicalPlan::Scan { source, schema } => {
-            writeln!(
-                out,
-                "{pad}{}: {} [{} cols]",
-                source.kind(),
-                source.display_path(),
-                schema.fields().len()
-            )?;
+        LogicalPlan::Scan { source, schema, projection } => {
+            match projection {
+                None => writeln!(
+                    out,
+                    "{pad}{}: {} [{} cols]",
+                    source.kind(),
+                    source.display_path(),
+                    schema.fields().len()
+                )?,
+                Some(cols) => writeln!(
+                    out,
+                    "{pad}{}: {}, projection=[{}]",
+                    source.kind(),
+                    source.display_path(),
+                    cols.join(", ")
+                )?,
+            }
         }
         LogicalPlan::Filter { input, predicate, .. } => {
             writeln!(out, "{pad}Filter: {}", predicate.display_name())?;

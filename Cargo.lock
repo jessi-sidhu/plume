@@ -1106,6 +1106,7 @@ dependencies = [
  "plume-core",
  "plume-exec",
  "plume-io",
+ "plume-optimizer",
  "rand",
  "tempfile",
 ]
@@ -1150,6 +1151,7 @@ dependencies = [
 name = "plume-optimizer"
 version = "0.0.1"
 dependencies = [
+ "arrow-schema",
  "plume-core",
 ]
 
