@@ -36,6 +36,10 @@ pub enum EvalError {
     Arrow(#[from] arrow::error::ArrowError),
     #[error("predicate is {0:?}, expected Boolean")]
     PredicateNotBoolean(DataType),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("not implemented yet: {0}")]
+    NotImplemented(String),
 }
 
 pub type EvalResult<T> = std::result::Result<T, EvalError>;

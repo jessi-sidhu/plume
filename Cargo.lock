@@ -1129,6 +1129,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "plume-core",
+ "tempfile",
  "thiserror",
 ]
 

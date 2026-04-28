@@ -14,3 +14,6 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
