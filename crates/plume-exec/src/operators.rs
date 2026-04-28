@@ -12,7 +12,8 @@ use arrow::csv;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use plume_core::Expr;
+use parquet::file::statistics::Statistics;
+use plume_core::{BinaryOperator, Expr, ScalarValue};
 
 use crate::eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
@@ -105,12 +106,25 @@ pub struct ParquetScanExec {
     /// parquet schema and ProjectionMask live behind the file metadata,
     /// which we re-read on every execute() call.
     projection: Option<Vec<String>>,
+    /// Conjunction of `col OP literal` predicates from the predicate
+    /// pushdown optimizer. Used as a row-group-pruning *hint*: if a row
+    /// group's min/max stats prove a predicate cannot be satisfied for
+    /// any value in that group, we skip reading the group entirely.
+    /// The Filter that originally held them stays in the plan and still
+    /// does the per-row check.
+    pushdown_predicates: Vec<Expr>,
     batch_size: usize,
 }
 
 impl ParquetScanExec {
     pub fn new(path: PathBuf, schema: SchemaRef) -> Self {
-        Self { path, schema, projection: None, batch_size: DEFAULT_BATCH_SIZE }
+        Self {
+            path,
+            schema,
+            projection: None,
+            pushdown_predicates: Vec::new(),
+            batch_size: DEFAULT_BATCH_SIZE,
+        }
     }
 
     pub fn with_projection(
@@ -122,8 +136,14 @@ impl ParquetScanExec {
             path,
             schema: projected_schema,
             projection: Some(projected_columns),
+            pushdown_predicates: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
         }
+    }
+
+    pub fn with_pushdown_predicates(mut self, preds: Vec<Expr>) -> Self {
+        self.pushdown_predicates = preds;
+        self
     }
 }
 
@@ -132,14 +152,37 @@ impl ExecutionPlan for ParquetScanExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_batch_size(self.batch_size);
+
+        // ---- row-group pruning via pushdown predicates ------------------
+        if !self.pushdown_predicates.is_empty() {
+            let metadata = builder.metadata();
+            let total = metadata.num_row_groups();
+            let parquet_schema = builder.parquet_schema();
+            let root = parquet_schema.root_schema();
+
+            let surviving: Vec<usize> = (0..total)
+                .filter(|&rg_idx| {
+                    let rg = metadata.row_group(rg_idx);
+                    self.pushdown_predicates.iter().all(|pred| {
+                        row_group_can_satisfy(pred, rg, root)
+                    })
+                })
+                .collect();
+
+            // Only set with_row_groups if we actually pruned some — passing
+            // every group is equivalent to not setting it but lets the
+            // reader take its default code path.
+            if surviving.len() < total {
+                builder = builder.with_row_groups(surviving);
+            }
+        }
+
+        // ---- column projection (Week 8) ---------------------------------
         let reader = match &self.projection {
             None => builder.build()?,
             Some(cols) => {
-                // Map column names to root-level indices in the parquet schema,
-                // then build a ProjectionMask. Names that aren't in the file
-                // surface as MissingColumn.
                 let parquet_schema = builder.parquet_schema();
                 let root = parquet_schema.root_schema();
                 let mut indices = Vec::with_capacity(cols.len());
@@ -156,6 +199,126 @@ impl ExecutionPlan for ParquetScanExec {
             }
         };
         Ok(Box::new(reader.map(|r| r.map_err(EvalError::from))))
+    }
+}
+
+// ------------------------------------------------------------------------
+// Row-group pruning helpers — Week 9
+//
+// `row_group_can_satisfy` returns false only when we can prove the
+// predicate has no matches in this row group. When in doubt (missing
+// stats, type mismatches, NULL literal, exotic types) it returns true
+// so the row group is read and the per-row Filter handles correctness.
+// ------------------------------------------------------------------------
+
+fn row_group_can_satisfy(
+    pred: &Expr,
+    rg: &parquet::file::metadata::RowGroupMetaData,
+    parquet_root: &parquet::schema::types::Type,
+) -> bool {
+    // Pull `col OP lit` out of the predicate. The optimizer normalized to
+    // column-on-the-left already, so we don't have to flip operators here.
+    let Expr::BinaryOp { left, op, right } = pred else { return true };
+    let Expr::Column(name) = left.as_ref() else { return true };
+    let Expr::Literal(lit) = right.as_ref() else { return true };
+
+    let Some(col_idx) = parquet_root.get_fields().iter().position(|f| f.name() == name) else {
+        return true; // unknown column — can't prune
+    };
+    let chunk = rg.column(col_idx);
+    let Some(stats) = chunk.statistics() else { return true };
+
+    // Treat all-null row groups specially: any non-null comparison is false
+    // for every row, so the group can be pruned.
+    if let Some(null_count) = stats.null_count_opt() {
+        if null_count == rg.num_rows() as u64 {
+            return false;
+        }
+    }
+
+    match (stats, lit) {
+        (Statistics::Int32(s), ScalarValue::Int32(v)) => {
+            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v as i64)
+        }
+        (Statistics::Int32(s), ScalarValue::Int64(v)) => {
+            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v)
+        }
+        (Statistics::Int64(s), ScalarValue::Int32(v)) => {
+            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v as i64)
+        }
+        (Statistics::Int64(s), ScalarValue::Int64(v)) => {
+            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
+        }
+        (Statistics::Float(s), ScalarValue::Float64(v)) => {
+            check_ord_f64(s.min_opt().copied().map(f64::from), s.max_opt().copied().map(f64::from), *op, *v)
+        }
+        (Statistics::Double(s), ScalarValue::Float64(v)) => {
+            check_ord_f64(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
+        }
+        (Statistics::ByteArray(s), ScalarValue::Utf8(v)) => {
+            // ByteArray min/max are byte slices; interpret as UTF-8.
+            let mn = s.min_opt().and_then(|b| std::str::from_utf8(b.data()).ok());
+            let mx = s.max_opt().and_then(|b| std::str::from_utf8(b.data()).ok());
+            check_ord_str(mn, mx, *op, v.as_str())
+        }
+        // Type mismatch / unsupported combo: assume the row group could match.
+        _ => true,
+    }
+}
+
+/// Generic ordered-type pruning check. Returns false only when proving the
+/// predicate `col OP lit` cannot be true for any value in [min, max].
+fn check_ord<T: Ord + Copy>(
+    min: Option<T>,
+    max: Option<T>,
+    op: BinaryOperator,
+    lit: T,
+) -> bool {
+    use BinaryOperator::*;
+    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    match op {
+        Eq => !(lit < mn || lit > mx),
+        // We can't exclude NotEq in general unless min == max == lit and
+        // there are no nulls. Conservative: keep.
+        NotEq => true,
+        Lt => mn < lit,
+        LtEq => mn <= lit,
+        Gt => mx > lit,
+        GtEq => mx >= lit,
+        _ => true,
+    }
+}
+
+/// f64 variant — uses partial_cmp; if any side is NaN the comparison is
+/// unreliable so we don't prune.
+fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f64) -> bool {
+    use BinaryOperator::*;
+    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    if mn.is_nan() || mx.is_nan() || lit.is_nan() {
+        return true;
+    }
+    match op {
+        Eq => !(lit < mn || lit > mx),
+        NotEq => true,
+        Lt => mn < lit,
+        LtEq => mn <= lit,
+        Gt => mx > lit,
+        GtEq => mx >= lit,
+        _ => true,
+    }
+}
+
+fn check_ord_str(min: Option<&str>, max: Option<&str>, op: BinaryOperator, lit: &str) -> bool {
+    use BinaryOperator::*;
+    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    match op {
+        Eq => !(lit < mn || lit > mx),
+        NotEq => true,
+        Lt => mn < lit,
+        LtEq => mn <= lit,
+        Gt => mx > lit,
+        GtEq => mx >= lit,
+        _ => true,
     }
 }
 

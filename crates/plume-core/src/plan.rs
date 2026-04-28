@@ -51,6 +51,13 @@ pub enum LogicalPlan {
         /// Set by the column-pruning optimizer (Week 8). `None` = read every
         /// column. `Some(names)` = read just these, in this order.
         projection: Option<Vec<String>>,
+        /// Conjunction of predicates pushed in by the predicate-pushdown
+        /// optimizer (Week 9). The scan uses these as a *hint* to skip row
+        /// groups whose statistics rule out a match. The Filter that
+        /// originally held them stays in the plan and still evaluates the
+        /// real per-row check — pushdown is a scan-level elision, not a
+        /// replacement for filtering.
+        pushdown_predicates: Vec<Expr>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -94,6 +101,7 @@ impl LogicalPlan {
             source: ScanSource::Csv { path: path.into() },
             schema,
             projection: None,
+            pushdown_predicates: Vec::new(),
         }
     }
 
@@ -102,6 +110,7 @@ impl LogicalPlan {
             source: ScanSource::Parquet { path: path.into() },
             schema,
             projection: None,
+            pushdown_predicates: Vec::new(),
         }
     }
 
@@ -127,7 +136,25 @@ impl LogicalPlan {
             source,
             schema: projected_schema,
             projection: Some(cols),
+            pushdown_predicates: Vec::new(),
         })
+    }
+
+    /// Attach pushdown predicates to a Scan node. Used by the
+    /// predicate-pushdown optimizer (Week 9). Returns an error if `plan` is
+    /// not a Scan.
+    pub fn with_pushdown_predicates(plan: LogicalPlan, predicates: Vec<Expr>) -> Result<Self> {
+        match plan {
+            LogicalPlan::Scan { source, schema, projection, .. } => Ok(LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                pushdown_predicates: predicates,
+            }),
+            _ => Err(PlumeError::Plan(
+                "with_pushdown_predicates: target plan must be a Scan".into(),
+            )),
+        }
     }
 
     pub fn filter(input: LogicalPlan, predicate: Expr) -> Result<Self> {
@@ -206,16 +233,16 @@ fn is_aggregate_expr(e: &Expr) -> bool {
 fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Result {
     let pad = "  ".repeat(depth);
     match plan {
-        LogicalPlan::Scan { source, schema, projection } => {
+        LogicalPlan::Scan { source, schema, projection, pushdown_predicates } => {
             match projection {
-                None => writeln!(
+                None => write!(
                     out,
                     "{pad}{}: {} [{} cols]",
                     source.kind(),
                     source.display_path(),
                     schema.fields().len()
                 )?,
-                Some(cols) => writeln!(
+                Some(cols) => write!(
                     out,
                     "{pad}{}: {}, projection=[{}]",
                     source.kind(),
@@ -223,6 +250,12 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
                     cols.join(", ")
                 )?,
             }
+            if !pushdown_predicates.is_empty() {
+                let preds: Vec<String> =
+                    pushdown_predicates.iter().map(|p| p.display_name()).collect();
+                write!(out, ", pushdown=[{}]", preds.join(", "))?;
+            }
+            writeln!(out)?;
         }
         LogicalPlan::Filter { input, predicate, .. } => {
             writeln!(out, "{pad}Filter: {}", predicate.display_name())?;

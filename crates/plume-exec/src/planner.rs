@@ -16,23 +16,30 @@ use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, Proj
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
     Ok(match plan {
-        LogicalPlan::Scan { source, schema, projection } => match source {
+        LogicalPlan::Scan { source, schema, projection, pushdown_predicates } => match source {
             ScanSource::Csv { path } => {
                 // The column-pruning optimizer skips CSV scans on purpose:
                 // CSV is row-oriented, so trimming columns saves only parse
-                // CPU, not I/O. If a projection landed here anyway, ignore
-                // it and read the full schema.
+                // CPU, not I/O. Same for predicate pushdown — there's no
+                // row-group concept to skip. Fall through to a plain scan.
                 let _ = projection;
+                let _ = pushdown_predicates;
                 Arc::new(CsvScanExec::new(path.clone(), schema.clone()))
             }
-            ScanSource::Parquet { path } => match projection {
-                None => Arc::new(ParquetScanExec::new(path.clone(), schema.clone())),
-                Some(cols) => Arc::new(ParquetScanExec::with_projection(
-                    path.clone(),
-                    schema.clone(),
-                    cols.clone(),
-                )),
-            },
+            ScanSource::Parquet { path } => {
+                let mut exec = match projection {
+                    None => ParquetScanExec::new(path.clone(), schema.clone()),
+                    Some(cols) => ParquetScanExec::with_projection(
+                        path.clone(),
+                        schema.clone(),
+                        cols.clone(),
+                    ),
+                };
+                if !pushdown_predicates.is_empty() {
+                    exec = exec.with_pushdown_predicates(pushdown_predicates.clone());
+                }
+                Arc::new(exec)
+            }
         },
         LogicalPlan::Filter { input, predicate, .. } => {
             let child = create_physical_plan(input)?;
