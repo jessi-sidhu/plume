@@ -8,7 +8,7 @@ use anyhow::Result;
 use arrow::compute::{kernels, sum};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
-use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
@@ -24,15 +24,10 @@ fn build_filter_and_sum_int32() -> Result<()> {
     let arr = Int32Array::from(vec![1, 6, 3, 8, 5, 7, 10]);
     let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])?;
 
-    let predicate = kernels::cmp::gt(
-        batch.column(0).as_ref(),
-        &Int32Array::new_scalar(5),
-    )?;
-    // gt returns BooleanArray; filter_record_batch wants &BooleanArray.
-    let filtered = arrow::compute::filter_record_batch(
-        &batch,
-        &BooleanArray::from(predicate),
-    )?;
+    // arrow 54 cmp kernels take &dyn Datum on both sides. ArrayRef coerces
+    // for the column; new_scalar wraps the literal.
+    let predicate = kernels::cmp::gt(batch.column(0), &Int32Array::new_scalar(5))?;
+    let filtered = arrow::compute::filter_record_batch(&batch, &predicate)?;
 
     let total = sum(filtered.column(0).as_primitive::<Int32Type>()).unwrap();
     assert_eq!(total, 6 + 8 + 7 + 10);
