@@ -58,6 +58,10 @@ pub enum LogicalPlan {
         /// real per-row check — pushdown is a scan-level elision, not a
         /// replacement for filtering.
         pushdown_predicates: Vec<Expr>,
+        /// Set by limit pushdown (Week 10). When `Some(n)`, the scan reads
+        /// at most `n` rows from the source. The Limit operator above
+        /// stays in the plan to enforce the contract end-to-end.
+        limit: Option<usize>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -102,6 +106,7 @@ impl LogicalPlan {
             schema,
             projection: None,
             pushdown_predicates: Vec::new(),
+            limit: None,
         }
     }
 
@@ -111,6 +116,7 @@ impl LogicalPlan {
             schema,
             projection: None,
             pushdown_predicates: Vec::new(),
+            limit: None,
         }
     }
 
@@ -137,22 +143,42 @@ impl LogicalPlan {
             schema: projected_schema,
             projection: Some(cols),
             pushdown_predicates: Vec::new(),
+            limit: None,
         })
     }
 
-    /// Attach pushdown predicates to a Scan node. Used by the
-    /// predicate-pushdown optimizer (Week 9). Returns an error if `plan` is
-    /// not a Scan.
+    /// Attach pushdown predicates to a Scan node. Preserves any existing
+    /// projection / limit. Used by the predicate-pushdown optimizer (Week 9).
     pub fn with_pushdown_predicates(plan: LogicalPlan, predicates: Vec<Expr>) -> Result<Self> {
         match plan {
-            LogicalPlan::Scan { source, schema, projection, .. } => Ok(LogicalPlan::Scan {
+            LogicalPlan::Scan { source, schema, projection, limit, .. } => Ok(LogicalPlan::Scan {
                 source,
                 schema,
                 projection,
                 pushdown_predicates: predicates,
+                limit,
             }),
             _ => Err(PlumeError::Plan(
                 "with_pushdown_predicates: target plan must be a Scan".into(),
+            )),
+        }
+    }
+
+    /// Set (or clear) a row limit on a Scan node. Used by limit pushdown
+    /// (Week 10).
+    pub fn with_scan_limit(plan: LogicalPlan, limit: Option<usize>) -> Result<Self> {
+        match plan {
+            LogicalPlan::Scan { source, schema, projection, pushdown_predicates, .. } => {
+                Ok(LogicalPlan::Scan {
+                    source,
+                    schema,
+                    projection,
+                    pushdown_predicates,
+                    limit,
+                })
+            }
+            _ => Err(PlumeError::Plan(
+                "with_scan_limit: target plan must be a Scan".into(),
             )),
         }
     }
@@ -233,7 +259,7 @@ fn is_aggregate_expr(e: &Expr) -> bool {
 fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Result {
     let pad = "  ".repeat(depth);
     match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates } => {
+        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => {
             match projection {
                 None => write!(
                     out,
@@ -254,6 +280,9 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
                 let preds: Vec<String> =
                     pushdown_predicates.iter().map(|p| p.display_name()).collect();
                 write!(out, ", pushdown=[{}]", preds.join(", "))?;
+            }
+            if let Some(n) = limit {
+                write!(out, ", limit={n}")?;
             }
             writeln!(out)?;
         }

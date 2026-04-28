@@ -16,14 +16,14 @@ use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, Proj
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
     Ok(match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates } => match source {
+        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => match source {
             ScanSource::Csv { path } => {
-                // The column-pruning optimizer skips CSV scans on purpose:
-                // CSV is row-oriented, so trimming columns saves only parse
-                // CPU, not I/O. Same for predicate pushdown — there's no
-                // row-group concept to skip. Fall through to a plain scan.
+                // CSV: pruning + pushdown don't apply; limit does (cheap to
+                // truncate the iterator). Build the plain CsvScanExec, wrap
+                // in LimitExec downstream if needed via the Limit operator.
                 let _ = projection;
                 let _ = pushdown_predicates;
+                let _ = limit;
                 Arc::new(CsvScanExec::new(path.clone(), schema.clone()))
             }
             ScanSource::Parquet { path } => {
@@ -37,6 +37,9 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                 };
                 if !pushdown_predicates.is_empty() {
                     exec = exec.with_pushdown_predicates(pushdown_predicates.clone());
+                }
+                if let Some(n) = limit {
+                    exec = exec.with_limit(*n);
                 }
                 Arc::new(exec)
             }

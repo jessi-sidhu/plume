@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use plume_bench::harness::assert_matches_duckdb;
-use plume_core::{col, count_star, lit, sum, DataFrame, LogicalPlan};
+use plume_core::{col, count_star, lit, sum, LogicalPlan};
 use plume_exec::{collect, ExecutionPlan, ParquetScanExec};
 use plume_io::{read_parquet_schema, scan_parquet_auto};
 use plume_optimizer::optimize;

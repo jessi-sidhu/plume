@@ -113,6 +113,9 @@ pub struct ParquetScanExec {
     /// The Filter that originally held them stays in the plan and still
     /// does the per-row check.
     pushdown_predicates: Vec<Expr>,
+    /// Optional row-count cap from the limit-pushdown optimizer. When set,
+    /// the scan tells the parquet reader to stop after `limit` rows.
+    limit: Option<usize>,
     batch_size: usize,
 }
 
@@ -123,6 +126,7 @@ impl ParquetScanExec {
             schema,
             projection: None,
             pushdown_predicates: Vec::new(),
+            limit: None,
             batch_size: DEFAULT_BATCH_SIZE,
         }
     }
@@ -137,12 +141,18 @@ impl ParquetScanExec {
             schema: projected_schema,
             projection: Some(projected_columns),
             pushdown_predicates: Vec::new(),
+            limit: None,
             batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 
     pub fn with_pushdown_predicates(mut self, preds: Vec<Expr>) -> Self {
         self.pushdown_predicates = preds;
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
         self
     }
 }
@@ -154,6 +164,9 @@ impl ExecutionPlan for ParquetScanExec {
         let file = File::open(&self.path)?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_batch_size(self.batch_size);
+        if let Some(n) = self.limit {
+            builder = builder.with_limit(n);
+        }
 
         // ---- row-group pruning via pushdown predicates ------------------
         if !self.pushdown_predicates.is_empty() {
