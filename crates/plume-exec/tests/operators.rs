@@ -102,7 +102,8 @@ fn limit_exec_caps_total_rows_across_batch_boundaries() {
 }
 
 #[test]
-fn planner_rejects_aggregate_for_now() {
+fn planner_rejects_grouped_aggregate_for_now() {
+    // GROUP BY is HashAggregateExec, Week 6.
     let df = plume_core::DataFrame::scan_csv("ignored", schema())
         .aggregate(vec![col("name")], vec![plume_core::sum(col("age"))])
         .unwrap();

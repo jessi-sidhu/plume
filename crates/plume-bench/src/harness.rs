@@ -16,8 +16,8 @@ use arrow_schema::Schema;
 use parquet::arrow::ArrowWriter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
@@ -40,12 +40,23 @@ fn render_cell(array: &dyn Array, i: usize) -> Result<String> {
         DataType::UInt16 => array.as_primitive::<UInt16Type>().value(i).to_string(),
         DataType::UInt32 => array.as_primitive::<UInt32Type>().value(i).to_string(),
         DataType::UInt64 => array.as_primitive::<UInt64Type>().value(i).to_string(),
-        // Floats: render with enough precision to distinguish neighbours, but
-        // not so much that platform float repr churns the diff.
-        DataType::Float32 => format!("{:.7}", array.as_primitive::<Float32Type>().value(i)),
-        DataType::Float64 => format!("{:.15}", array.as_primitive::<Float64Type>().value(i)),
+        // Floats: 12 decimals for f64 / 6 for f32. f64 has ~15-17 sig digits
+        // but two engines summing in different orders agree to ~12; demanding
+        // more turns SUM/AVG diffs into noise.
+        DataType::Float32 => format!("{:.6}", array.as_primitive::<Float32Type>().value(i)),
+        DataType::Float64 => format!("{:.12}", array.as_primitive::<Float64Type>().value(i)),
         DataType::Utf8 => array.as_string::<i32>().value(i).to_string(),
         DataType::LargeUtf8 => array.as_string::<i64>().value(i).to_string(),
+        // DuckDB returns SUM(integer) as DECIMAL(38,0) by default; render as
+        // the underlying i128 so it compares cleanly against plume's Int64.
+        DataType::Decimal128(_, scale) => {
+            let v = array.as_primitive::<Decimal128Type>().value(i);
+            if *scale == 0 {
+                v.to_string()
+            } else {
+                format!("decimal128(scale={scale},val={v})")
+            }
+        }
         other => bail!("render_cell: unsupported type {other:?}"),
     })
 }
