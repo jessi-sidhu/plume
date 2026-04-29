@@ -7,12 +7,14 @@
 //! - `planner`: LogicalPlan → ExecutionPlan + `collect()` (Week 4+).
 
 pub mod aggregate;
+pub mod compiled;
 pub mod eval;
 pub mod exec;
 pub mod operators;
 pub mod planner;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
+pub use compiled::{compile, CompiledExpr};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
 pub use exec::{BatchStream, ExecutionPlan};
 pub use operators::{

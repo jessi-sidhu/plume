@@ -21,7 +21,12 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 
 [[bin]]
 name = "gen_fixtures"
 path = "src/bin/gen_fixtures.rs"
+
+[[bench]]
+name = "queries"
+harness = false

@@ -15,7 +15,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::statistics::Statistics;
 use plume_core::{BinaryOperator, Expr, ScalarValue};
 
-use crate::eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
+use crate::compiled::{compile, CompiledExpr};
+use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -362,14 +363,25 @@ impl ExecutionPlan for MemoryExec {
 
 pub struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
-    predicate: Expr,
+    /// Pre-compiled predicate (W11). Column indices already resolved against
+    /// the input schema, so the per-batch hot path skips name lookups.
+    compiled: CompiledExpr,
     schema: SchemaRef,
 }
 
 impl FilterExec {
+    /// Construct from a logical `Expr`. The predicate is compiled once here
+    /// against `input.schema()` and reused for every batch.
     pub fn new(input: Arc<dyn ExecutionPlan>, predicate: Expr) -> Self {
         let schema = input.schema();
-        Self { input, predicate, schema }
+        // Schema-build-time errors should already have been caught by the
+        // logical plan layer (LogicalPlan::filter validates the predicate
+        // resolves cleanly against the input schema). If somehow a bad
+        // predicate slipped through, surface it loudly at construction.
+        let compiled = compile(&predicate, schema.as_ref())
+            .expect("predicate failed to compile against input schema; \
+                    LogicalPlan::filter should have caught this at plan time");
+        Self { input, compiled, schema }
     }
 }
 
@@ -378,10 +390,10 @@ impl ExecutionPlan for FilterExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let stream = self.input.execute()?;
-        let predicate = self.predicate.clone();
+        let compiled = self.compiled.clone();
         Ok(Box::new(stream.map(move |batch| {
             let batch = batch?;
-            let mask = evaluate_predicate(&predicate, &batch)?;
+            let mask = compiled.evaluate_predicate(&batch)?;
             let filtered = filter_record_batch(&batch, &mask)?;
             Ok(filtered)
         })))
@@ -392,13 +404,20 @@ impl ExecutionPlan for FilterExec {
 
 pub struct ProjectionExec {
     input: Arc<dyn ExecutionPlan>,
-    exprs: Vec<Expr>,
+    compiled: Vec<CompiledExpr>,
     schema: SchemaRef,
 }
 
 impl ProjectionExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, exprs: Vec<Expr>, schema: SchemaRef) -> Self {
-        Self { input, exprs, schema }
+        let in_schema = input.schema();
+        let compiled = exprs
+            .iter()
+            .map(|e| compile(e, in_schema.as_ref()))
+            .collect::<EvalResult<Vec<_>>>()
+            .expect("projection expressions failed to compile against input schema; \
+                    LogicalPlan::project should have caught this at plan time");
+        Self { input, compiled, schema }
     }
 }
 
@@ -407,13 +426,13 @@ impl ExecutionPlan for ProjectionExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let stream = self.input.execute()?;
-        let exprs = self.exprs.clone();
+        let compiled = self.compiled.clone();
         let schema = self.schema.clone();
         Ok(Box::new(stream.map(move |batch| {
             let batch = batch?;
-            let arrays = exprs
+            let arrays = compiled
                 .iter()
-                .map(|e| evaluate(e, &batch))
+                .map(|c| c.evaluate(&batch))
                 .collect::<EvalResult<Vec<_>>>()?;
             Ok(RecordBatch::try_new(schema.clone(), arrays)?)
         })))
