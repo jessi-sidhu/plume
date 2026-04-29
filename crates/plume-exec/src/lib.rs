@@ -11,11 +11,13 @@ pub mod compiled;
 pub mod eval;
 pub mod exec;
 pub mod operators;
+pub mod parallel;
 pub mod planner;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
+pub use parallel::ParallelParquetScanExec;
 pub use exec::{BatchStream, ExecutionPlan};
 pub use operators::{
     CsvScanExec, FilterExec, LimitExec, MemoryExec, ParquetScanExec, ProjectionExec,

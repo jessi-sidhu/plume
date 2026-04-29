@@ -29,6 +29,7 @@ thiserror = "1"
 duckdb = { version = "1", features = ["bundled", "parquet"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+rayon = "1.10"
 
 plume-core = { path = "crates/plume-core" }
 plume-exec = { path = "crates/plume-exec" }
