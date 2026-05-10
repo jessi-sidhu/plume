@@ -174,6 +174,28 @@ fn prune_with_required(
             let pruned_input = prune_with_required(*input, required_from_above)?;
             Ok(LogicalPlan::limit(pruned_input, n))
         }
+        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+            // Phase 1 passthrough: do NOT prune across joins yet. Recurse
+            // into each side with that side's full schema as required, so
+            // the children come back schema-equal and the rebuilt Join
+            // has the same output schema. Cross-join pruning lands in
+            // the join-aware optimizer pass.
+            let left_required: HashSet<String> = left
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let right_required: HashSet<String> = right
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let new_left = prune_with_required(*left, &left_required)?;
+            let new_right = prune_with_required(*right, &right_required)?;
+            LogicalPlan::join(new_left, new_right, on, filter, join_type)
+        }
     }
 }
 
@@ -249,6 +271,15 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
         LogicalPlan::Limit { input, n, schema: _ } => {
             let new_input = push_through(*input)?;
             Ok(LogicalPlan::limit(new_input, n))
+        }
+        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+            // Phase 1 passthrough: recurse into both children. Pushdown
+            // *across* joins (splitting AND-conjuncts above the join into
+            // left/right buckets, with outer-join nullable-side safety)
+            // is the load-bearing piece of Phase 5.
+            let new_left = push_through(*left)?;
+            let new_right = push_through(*right)?;
+            LogicalPlan::join(new_left, new_right, on, filter, join_type)
         }
     }
 }
@@ -436,6 +467,19 @@ fn rewrite_exprs_in_plan(plan: LogicalPlan, f: &impl Fn(Expr) -> Expr) -> Result
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             LogicalPlan::limit(new_input, n)
         }
+        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+            let new_left = rewrite_exprs_in_plan(*left, f)?;
+            let new_right = rewrite_exprs_in_plan(*right, f)?;
+            // Apply f to both halves of every key pair, plus the residual
+            // filter. f is schema-preserving (it folds expression sub-trees
+            // to literals), so the rebuilt Join has the same output schema.
+            let new_on: Vec<(Expr, Expr)> = on
+                .into_iter()
+                .map(|(l, r)| (f(l), f(r)))
+                .collect();
+            let new_filter = filter.map(f);
+            LogicalPlan::join(new_left, new_right, new_on, new_filter, join_type)?
+        }
     })
 }
 
@@ -473,6 +517,11 @@ impl OptimizerRule for DeadProjectionElim {
                 Ok(LogicalPlan::limit(self.rewrite(*input)?, n))
             }
             LogicalPlan::Scan { .. } => Ok(plan),
+            LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+                let new_left = self.rewrite(*left)?;
+                let new_right = self.rewrite(*right)?;
+                LogicalPlan::join(new_left, new_right, on, filter, join_type)
+            }
         }
     }
 }
@@ -530,6 +579,14 @@ impl OptimizerRule for LimitPushdown {
                 LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs)
             }
             LogicalPlan::Scan { .. } => Ok(plan),
+            LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+                // Joins change row count, so a Limit above never folds
+                // through. Recurse into both children to allow
+                // Limit-pushdown opportunities inside each subtree.
+                let new_left = self.rewrite(*left)?;
+                let new_right = self.rewrite(*right)?;
+                LogicalPlan::join(new_left, new_right, on, filter, join_type)
+            }
         }
     }
 }

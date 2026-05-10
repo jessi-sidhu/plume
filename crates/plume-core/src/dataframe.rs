@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use arrow_schema::SchemaRef;
 
 use crate::expr::Expr;
-use crate::plan::LogicalPlan;
+use crate::plan::{JoinType, LogicalPlan};
 use crate::Result;
 
 #[derive(Debug, Clone)]
@@ -38,6 +38,26 @@ impl DataFrame {
 
     pub fn limit(self, n: usize) -> Self {
         DataFrame { plan: LogicalPlan::limit(self.plan, n) }
+    }
+
+    /// Equi-join `self` with `right` on `on` (parallel `(left_expr,
+    /// right_expr)` pairs). Use one of the `JoinType` variants except
+    /// `Cross` — pass an empty `on` and `JoinType::Cross` (or use
+    /// `cross_join`) for the no-keys case.
+    pub fn join(
+        self,
+        right: DataFrame,
+        on: Vec<(Expr, Expr)>,
+        join_type: JoinType,
+    ) -> Result<Self> {
+        Ok(DataFrame {
+            plan: LogicalPlan::join(self.plan, right.plan, on, None, join_type)?,
+        })
+    }
+
+    /// Cross join: every row on the left paired with every row on the right.
+    pub fn cross_join(self, right: DataFrame) -> Result<Self> {
+        Ok(DataFrame { plan: LogicalPlan::cross_join(self.plan, right.plan)? })
     }
 
     pub fn schema(&self) -> SchemaRef {

@@ -28,6 +28,7 @@ fn scan_node(plan: &LogicalPlan) -> &LogicalPlan {
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. } => scan_node(input),
+        LogicalPlan::Join { left, .. } => scan_node(left),
     }
 }
 

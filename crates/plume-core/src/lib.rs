@@ -27,4 +27,4 @@ pub use expr::{
     avg, col, count, count_star, lit, max, min, sum, AggregateFunction, BinaryOperator, Expr,
     ScalarValue,
 };
-pub use plan::{LogicalPlan, ScanSource};
+pub use plan::{JoinType, LogicalPlan, ScanSource};

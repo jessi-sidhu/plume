@@ -25,6 +25,7 @@ fn scan_pushdowns(plan: &LogicalPlan) -> Option<Vec<String>> {
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. } => scan_pushdowns(input),
+        LogicalPlan::Join { left, .. } => scan_pushdowns(left),
     }
 }
 
@@ -142,6 +143,7 @@ fn optimize_runs_pushdown_then_pruning_in_one_call() {
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Limit { input, .. } => scan_proj(input),
+            LogicalPlan::Join { left, .. } => scan_proj(left),
         }
     }
     let proj = scan_proj(&optimized).expect("scan should be projected");

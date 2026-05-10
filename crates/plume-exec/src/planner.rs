@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use arrow::error::ArrowError;
 use arrow_array::RecordBatch;
 use plume_core::{LogicalPlan, ScanSource};
 
@@ -68,6 +69,17 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                     schema.clone(),
                 ))
             }
+        }
+        LogicalPlan::Join { join_type, .. } => {
+            // Join planning lands in the next commit (HashJoinExec /
+            // CrossJoinExec). For now the plan layer accepts joins so
+            // builder/schema/display work can ship independently; lowering
+            // a join to a physical plan still errors cleanly.
+            return Err(ArrowError::NotYetImplemented(format!(
+                "{} join lowering is not implemented yet",
+                join_type.name()
+            ))
+            .into());
         }
     })
 }
