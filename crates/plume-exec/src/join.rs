@@ -3,15 +3,38 @@
 //! `HashJoinExec` is a build-then-probe equi-join. The right input is fully
 //! drained into a hash table keyed by the right-side join exprs (NULL keys
 //! never get inserted — see `keys::key_has_null` for the SQL semantics);
-//! left batches then stream through and emit one output row per match. The
-//! optional residual filter is evaluated on the concatenated row pair after
-//! the hash match, so AND-conjuncts that mention both sides can ride along.
+//! left batches then stream through and emit output rows per the join type:
+//!
+//! - **Inner** — emit one row per (left, build) match. NULL-keyed left rows
+//!   and left rows with no match are dropped.
+//! - **Left** — same as Inner for matches. Left rows with no match
+//!   (including NULL-keyed) are emitted with right columns NULL-padded.
+//! - **Right** — same as Inner for matches, plus a per-build-row bitmap
+//!   tracks which build rows ever matched. After the probe finishes,
+//!   unmatched build rows are emitted with left columns NULL-padded.
+//! - **Full** — Left + Right combined: emit unmatched left rows per probe
+//!   batch and unmatched build rows after the loop.
+//! - **Semi** — emit each left row that has *at least one* match, just the
+//!   left columns, no duplicates per left row. Right is consulted for the
+//!   existence check only.
+//! - **Anti** — emit each left row with *no* match (including NULL-keyed),
+//!   just the left columns.
+//!
+//! Optional residual filter is evaluated on the concatenated *matched* row
+//! pair, so AND-conjuncts that mention both sides can ride along. The plan
+//! layer rejects residuals on outer joins (folding a both-side predicate
+//! into an outer-join residual would change semantics — that's the
+//! optimizer's job), so the filter is reachable only for Inner / Cross.
 //!
 //! Output columns are materialized via `arrow::compute::take` over a single
 //! contiguous build-side `RecordBatch` (built from `concat_batches` over all
 //! right batches). Going through `take` keeps the per-row work down to two
 //! Vec<u32> pushes during probe; the heavy lifting happens once when we
-//! emit a batch.
+//! emit a batch. NULL-padded sides use `arrow_array::new_null_array` to
+//! manufacture an all-null array of the right type and length — the join's
+//! output schema already widens nullability for the side that may emit
+//! NULLs (see `LogicalPlan::join`'s schema rules), so the resulting batch
+//! validates against the schema cleanly.
 //!
 //! Output batches are sized to `DEFAULT_BATCH_SIZE` (8192) when possible.
 //! A single left row that matches many right rows can overshoot, which is
@@ -21,18 +44,16 @@
 //! map entirely: every left row pairs with every right row, optionally
 //! filtered by a residual.
 //!
-//! This commit covers `JoinType::Inner` and `JoinType::Cross`. Outer joins
-//! (Left/Right/Full) need a build-side matched bitmap and a post-probe
-//! emission step for unmatched rows; that lands in the next commit. Semi
-//! and Anti emit only the left side; that lands one commit after.
+//! For Semi/Anti the output schema is exactly the left input's schema (no
+//! right columns, no widening), as required by `LogicalPlan::join`'s rules.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow::compute::take;
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{new_null_array, Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
+use arrow_schema::{Schema, SchemaRef};
 use plume_core::{Expr, JoinType};
 
 use crate::eval::{evaluate, EvalError, EvalResult};
@@ -84,14 +105,27 @@ impl ExecutionPlan for HashJoinExec {
 
     fn execute(&self) -> EvalResult<BatchStream> {
         match self.join_type {
-            JoinType::Inner => {}
-            other => {
-                return Err(EvalError::NotImplemented(format!(
-                    "{} join lowering is not implemented yet",
-                    other.name()
-                )));
+            JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::Semi
+            | JoinType::Anti => {}
+            JoinType::Cross => {
+                return Err(EvalError::NotImplemented(
+                    "cross join is handled by CrossJoinExec, not HashJoinExec".into(),
+                ));
             }
         }
+        let emit_match_pairs = matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        );
+        let emit_unmatched_left = matches!(self.join_type, JoinType::Left | JoinType::Full);
+        let track_right_bitmap = matches!(self.join_type, JoinType::Right | JoinType::Full);
+        let is_semi = matches!(self.join_type, JoinType::Semi);
+        let is_anti = matches!(self.join_type, JoinType::Anti);
+        let output_only_left = matches!(self.join_type, JoinType::Semi | JoinType::Anti);
 
         // ---- BUILD ----------------------------------------------------
         // Drain the right side into one contiguous build table so we can
@@ -110,6 +144,14 @@ impl ExecutionPlan for HashJoinExec {
         // Build hashmap: key -> Vec<row_idx_in_build_table>. Multiple
         // build rows can share a key, hence Vec.
         let mut index: HashMap<Vec<KeyValue>, Vec<u32>> = HashMap::new();
+        // Per-build-row matched bitmap (Right / Full only). NULL-keyed
+        // build rows aren't in the index, so they're never set true and
+        // are correctly emitted as unmatched-right rows for Right/Full.
+        let mut matched_bitmap: Vec<bool> = if track_right_bitmap {
+            vec![false; build_table.num_rows()]
+        } else {
+            Vec::new()
+        };
         if build_table.num_rows() > 0 {
             let key_arrays: Vec<ArrayRef> = self
                 .on_right
@@ -137,6 +179,7 @@ impl ExecutionPlan for HashJoinExec {
         let schema = self.schema.clone();
         let left_schema = self.left.schema();
         let n_left_cols = left_schema.fields().len();
+        let n_right_cols = build_table.num_columns();
 
         // Collect all output batches up front. Streaming would require a
         // longer-lived hashmap reference + index iteration; for the row
@@ -145,6 +188,10 @@ impl ExecutionPlan for HashJoinExec {
         let mut out_batches: Vec<RecordBatch> = Vec::new();
         let mut left_idx_buf: Vec<u32> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
         let mut right_idx_buf: Vec<u32> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut left_unmatched_buf: Vec<u32> = Vec::new();
+        // Semi/Anti share this buffer — they're mutually exclusive, and
+        // both emit a left-cols-only batch from it.
+        let mut left_only_buf: Vec<u32> = Vec::new();
 
         // Each left batch contributes its own (left_buf, right_buf) gather
         // pair, because `left_idx_buf` indexes into the *current* left
@@ -164,13 +211,43 @@ impl ExecutionPlan for HashJoinExec {
                 for arr in &key_arrays {
                     key.push(extract_key(arr, row)?);
                 }
+                // NULL-keyed left rows can never match any build row
+                // (NULL ≠ NULL in equi-join). Where they go depends on
+                // the join type: dropped for Inner/Right/Semi; emitted
+                // as unmatched for Left/Full/Anti.
                 if key_has_null(&key) {
+                    if emit_unmatched_left {
+                        left_unmatched_buf.push(row as u32);
+                    }
+                    if is_anti {
+                        left_only_buf.push(row as u32);
+                    }
                     continue;
                 }
-                if let Some(matches) = index.get(&key) {
-                    for &right_row in matches {
-                        left_idx_buf.push(row as u32);
-                        right_idx_buf.push(right_row);
+                match index.get(&key) {
+                    Some(matches) => {
+                        if emit_match_pairs {
+                            for &right_row in matches {
+                                left_idx_buf.push(row as u32);
+                                right_idx_buf.push(right_row);
+                                if track_right_bitmap {
+                                    matched_bitmap[right_row as usize] = true;
+                                }
+                            }
+                        }
+                        if is_semi {
+                            // Semi: one emission per matched left row,
+                            // regardless of how many build rows matched.
+                            left_only_buf.push(row as u32);
+                        }
+                    }
+                    None => {
+                        if emit_unmatched_left {
+                            left_unmatched_buf.push(row as u32);
+                        }
+                        if is_anti {
+                            left_only_buf.push(row as u32);
+                        }
                     }
                 }
             }
@@ -190,6 +267,53 @@ impl ExecutionPlan for HashJoinExec {
                 }
                 left_idx_buf.clear();
                 right_idx_buf.clear();
+            }
+            if emit_unmatched_left && !left_unmatched_buf.is_empty() {
+                let batch = build_left_unmatched_batch(
+                    &schema,
+                    &left_batch,
+                    &left_unmatched_buf,
+                    n_left_cols,
+                    n_right_cols,
+                    &build_table,
+                )?;
+                if batch.num_rows() > 0 {
+                    out_batches.push(batch);
+                }
+                left_unmatched_buf.clear();
+            }
+            if output_only_left && !left_only_buf.is_empty() {
+                let batch = build_left_only_batch(
+                    &schema,
+                    &left_batch,
+                    &left_only_buf,
+                    n_left_cols,
+                )?;
+                if batch.num_rows() > 0 {
+                    out_batches.push(batch);
+                }
+                left_only_buf.clear();
+            }
+        }
+
+        // ---- POST-PROBE: unmatched build rows (Right / Full) ----------
+        if track_right_bitmap {
+            let unmatched_right: Vec<u32> = matched_bitmap
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| if *m { None } else { Some(i as u32) })
+                .collect();
+            if !unmatched_right.is_empty() {
+                let batch = build_right_unmatched_batch(
+                    &schema,
+                    &build_table,
+                    &unmatched_right,
+                    n_left_cols,
+                    &left_schema,
+                )?;
+                if batch.num_rows() > 0 {
+                    out_batches.push(batch);
+                }
             }
         }
 
@@ -342,4 +466,75 @@ fn build_join_batch(
     } else {
         Ok(batch)
     }
+}
+
+/// Build an output batch where the *left* columns come from `left_batch` at
+/// `left_idx`, and the *right* columns are entirely NULL of the right side's
+/// data types. Used by Left and Full to emit unmatched left rows.
+///
+/// `build_table` is consulted only for its right-side data types — its row
+/// data is not gathered. We use the build table rather than the live right
+/// schema so the data types match the actual source arrays the matched-row
+/// path also draws from (which `take` produces with their original types).
+fn build_left_unmatched_batch(
+    output_schema: &SchemaRef,
+    left_batch: &RecordBatch,
+    left_idx: &[u32],
+    n_left_cols: usize,
+    n_right_cols: usize,
+    build_table: &RecordBatch,
+) -> EvalResult<RecordBatch> {
+    let left_indices: ArrayRef = Arc::new(UInt32Array::from(left_idx.to_vec()));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_left_cols + n_right_cols);
+    for col in 0..n_left_cols {
+        cols.push(take(left_batch.column(col).as_ref(), &left_indices, None)?);
+    }
+    for col in 0..n_right_cols {
+        cols.push(new_null_array(
+            build_table.column(col).data_type(),
+            left_idx.len(),
+        ));
+    }
+    Ok(RecordBatch::try_new(output_schema.clone(), cols)?)
+}
+
+/// Gather only the left columns into a batch with `output_schema` (which
+/// for Semi/Anti is exactly the left input's schema). Used by Semi (matched
+/// left rows) and Anti (unmatched left rows).
+fn build_left_only_batch(
+    output_schema: &SchemaRef,
+    left_batch: &RecordBatch,
+    left_idx: &[u32],
+    n_left_cols: usize,
+) -> EvalResult<RecordBatch> {
+    let left_indices: ArrayRef = Arc::new(UInt32Array::from(left_idx.to_vec()));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_left_cols);
+    for col in 0..n_left_cols {
+        cols.push(take(left_batch.column(col).as_ref(), &left_indices, None)?);
+    }
+    Ok(RecordBatch::try_new(output_schema.clone(), cols)?)
+}
+
+/// Symmetric: right columns come from `build_table` at `right_idx`, left
+/// columns are entirely NULL of the left input's data types. Used by Right
+/// and Full to emit unmatched build rows after the probe completes.
+fn build_right_unmatched_batch(
+    output_schema: &SchemaRef,
+    build_table: &RecordBatch,
+    right_idx: &[u32],
+    n_left_cols: usize,
+    left_schema: &Schema,
+) -> EvalResult<RecordBatch> {
+    let right_indices: ArrayRef = Arc::new(UInt32Array::from(right_idx.to_vec()));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_left_cols + build_table.num_columns());
+    for col in 0..n_left_cols {
+        cols.push(new_null_array(
+            left_schema.field(col).data_type(),
+            right_idx.len(),
+        ));
+    }
+    for col in 0..build_table.num_columns() {
+        cols.push(take(build_table.column(col).as_ref(), &right_indices, None)?);
+    }
+    Ok(RecordBatch::try_new(output_schema.clone(), cols)?)
 }

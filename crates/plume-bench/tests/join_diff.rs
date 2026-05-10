@@ -116,6 +116,164 @@ fn inner_join_then_filter_above() -> Result<()> {
     )
 }
 
+// ---- Outer joins -------------------------------------------------------
+
+#[test]
+fn left_join_keeps_unmatched_left_rows() -> Result<()> {
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Left,
+        )?
+        .into_plan();
+    let actual = collect(&plan)?;
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region, \
+                orders.id, orders.customer_id, orders.region, orders.amount \
+         FROM customers LEFT JOIN orders ON customers.id = orders.customer_id",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
+#[test]
+fn right_join_keeps_unmatched_right_rows() -> Result<()> {
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Right,
+        )?
+        .into_plan();
+    let actual = collect(&plan)?;
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region, \
+                orders.id, orders.customer_id, orders.region, orders.amount \
+         FROM customers RIGHT JOIN orders ON customers.id = orders.customer_id",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
+#[test]
+fn full_join_keeps_both_unmatched_sides() -> Result<()> {
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Full,
+        )?
+        .into_plan();
+    let actual = collect(&plan)?;
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region, \
+                orders.id, orders.customer_id, orders.region, orders.amount \
+         FROM customers FULL OUTER JOIN orders ON customers.id = orders.customer_id",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
+#[test]
+fn left_join_then_filter_on_right_amount_strips_nulls() -> Result<()> {
+    // Filter sits ABOVE the join. A row from the LEFT side that didn't
+    // match an order produces orders.amount = NULL, and `NULL > 100`
+    // is NULL (not true), so the filter drops it. The unoptimized
+    // pipeline still gives the same answer DuckDB does — that's what
+    // we check here. Phase 5's pushdown rule must NOT push this
+    // predicate through the join (a regression test for that rule
+    // lives in optimizer/tests/, not here).
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Left,
+        )?
+        .filter(col("amount").gt(lit(100.0_f64)))?
+        .into_plan();
+    let actual = collect(&plan)?;
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region, \
+                orders.id, orders.customer_id, orders.region, orders.amount \
+         FROM customers LEFT JOIN orders ON customers.id = orders.customer_id \
+         WHERE orders.amount > 100.0",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
+// ---- Semi / Anti -------------------------------------------------------
+
+#[test]
+fn semi_join_emits_only_matched_left_rows() -> Result<()> {
+    // SEMI: customers that have at least one order. No duplicate
+    // customer rows even when a customer has many orders. Output is
+    // exactly the customers schema.
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Semi,
+        )?
+        .into_plan();
+    let actual = collect(&plan)?;
+    // DuckDB equivalent: WHERE EXISTS subquery. Returns one row per
+    // qualifying customer.
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region \
+         FROM customers \
+         WHERE EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id)",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
+#[test]
+fn anti_join_emits_unmatched_left_rows() -> Result<()> {
+    // ANTI: customers with NO orders, plus customers with NULL ids
+    // (NULL ≠ NULL means they never match anything).
+    let Some(c) = customers_path() else { return Ok(()) };
+    let Some(o) = orders_path() else { return Ok(()) };
+    let plan = scan_parquet_auto(&c)?
+        .join(
+            scan_parquet_auto(&o)?,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Anti,
+        )?
+        .into_plan();
+    let actual = collect(&plan)?;
+    assert_matches_duckdb(
+        &actual,
+        "SELECT customers.id, customers.name, customers.region \
+         FROM customers \
+         WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id)",
+        &[],
+        &[("customers", &c), ("orders", &o)],
+        false,
+    )
+}
+
 // ---- Cross join --------------------------------------------------------
 
 #[test]

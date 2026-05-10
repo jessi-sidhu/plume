@@ -10,7 +10,7 @@ use arrow_array::RecordBatch;
 use plume_core::{JoinType, LogicalPlan, ScanSource};
 
 use crate::aggregate::{AggregateExec, HashAggregateExec};
-use crate::eval::{EvalError, EvalResult};
+use crate::eval::EvalResult;
 use crate::exec::ExecutionPlan;
 use crate::join::{CrossJoinExec, HashJoinExec};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
@@ -80,7 +80,12 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                     filter.clone(),
                     schema.clone(),
                 )),
-                JoinType::Inner => Arc::new(HashJoinExec::new(
+                JoinType::Inner
+                | JoinType::Left
+                | JoinType::Right
+                | JoinType::Full
+                | JoinType::Semi
+                | JoinType::Anti => Arc::new(HashJoinExec::new(
                     left_exec,
                     right_exec,
                     on.clone(),
@@ -88,15 +93,6 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                     *join_type,
                     schema.clone(),
                 )),
-                // Outer joins land in the next commit; semi/anti the one
-                // after. Builder still accepts them so plan-level work can
-                // ship; lowering errors cleanly until the operator exists.
-                other => {
-                    return Err(EvalError::NotImplemented(format!(
-                        "{} join lowering is not implemented yet",
-                        other.name()
-                    )));
-                }
             }
         }
     })
