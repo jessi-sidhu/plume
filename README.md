@@ -146,36 +146,29 @@ parquet, modulo summation-order drift past the 10th significant digit.
 `plume-core` (~990 lines). `LogicalPlan` and `Expr` enums, the
 `DataFrame` builder, schema-time type checking. Every plan node knows
 its output schema. Aggregate nodes reject non-aggregate expressions in
-agg position at plan-build time, before anything runs. `LogicalPlan::Join`
-is the one multi-input variant: it concatenates left ++ right schemas
-with collision suffixing (`id`, `id_1`) and widens nullability for
-whichever side a Left/Right/Full join may emit unmatched-row NULLs for.
+agg position at plan-build time, before anything runs. The `Join`
+variant is the one multi-input node. Schemas concatenate left then
+right with collision suffixes (`id`, `id_1`), and nullability widens
+on whichever side an outer join may emit unmatched rows for.
 
 `plume-exec` (~2,500 lines). The execution side. `ExecutionPlan` trait
 returning a `Box<dyn Iterator<Item = Result<RecordBatch>> + Send>`,
 operators for CSV/Parquet scans, filter, projection, limit, global and
-hash-grouped aggregates, and `HashJoinExec` (Inner/Left/Right/Full/Semi/Anti)
-+ `CrossJoinExec`. Hash join is build-then-probe; the build side is
-drained into a single `concat_batches`'d table and addressed by u32
-index, so output materialization goes through `arrow::compute::take`.
-Outer joins keep a build-side matched bitmap and emit unmatched rows
-NULL-padded via `arrow_array::new_null_array`. The compiled-expression
-hot path lives here too: column names get resolved to indices once at
-operator construction so the per-batch loop is a vec lookup instead
-of a HashMap probe. Opt-in `ParallelParquetScanExec` reads row groups
-in parallel via rayon.
+hash-grouped aggregates, hash join in all six equi shapes
+(Inner/Left/Right/Full/Semi/Anti), and cross join. The compiled-
+expression hot path lives here: column names get resolved to indices
+once at operator construction so the per-batch loop is a vec lookup
+instead of a HashMap probe. Opt-in `ParallelParquetScanExec` reads
+row groups in parallel via rayon.
 
-`plume-optimizer` (~840 lines). Five rules plus the fixed-point driver.
-Each rule implements a small `OptimizerRule` trait (`name()` and
-`rewrite(plan) -> Result<plan>`). The driver runs the list to
-convergence (compared by `PartialEq` on `LogicalPlan`) with a hard cap
-of 8 passes so a misbehaving rule that flip-flops doesn't loop forever.
-PredicatePushdown and ColumnPruning are join-aware: pushdown splits
-AND-conjuncts above a Join into per-side buckets and respects
-outer-join safety (a right-only predicate above a Left join *must not*
-push to the right input — it would discard NULL-padded rows the join
-is supposed to preserve), and pruning splits the parent's required
-column set across the join based on output position.
+`plume-optimizer` (~840 lines). Five rules plus a fixed-point driver
+that compares plans by `PartialEq` and caps at 8 passes. Each rule
+implements `OptimizerRule` (`name()` + `rewrite(plan) -> Result<plan>`).
+Two of the rules are join-aware: PredicatePushdown splits AND-conjuncts
+above a join into per-side buckets and refuses to push a right-only
+predicate through a Left join (it would discard NULL-padded rows).
+ColumnPruning splits the parent's required column set across the two
+inputs based on output position.
 
 `plume-io` (30 lines). One file. Reads parquet metadata to produce a
 `SchemaRef`, then constructs a `DataFrame` rooted at a Parquet scan.
@@ -249,13 +242,27 @@ parallel scan only spawns tasks for the other half.
 
 ## Joins
 
-Six equi-join shapes plus cross join, all built on the same
-`HashJoinExec` (Cross has its own operator). Build the right side into
-a hash table, probe the left, materialize via `arrow::compute::take`.
-NULL keys never get inserted into the hash table — equi-join NULL ≠
-NULL — so they short-circuit on the probe side too. Outer joins keep
-a per-build-row matched bitmap and emit unmatched rows NULL-padded
-after the loop.
+Six equi shapes (Inner / Left / Right / Full / Semi / Anti) plus cross,
+all riding on one `HashJoinExec`. Build the right side into a hash
+table, probe the left, gather output indices, materialize one batch
+per probe-side input via `arrow::compute::take`.
+
+```mermaid
+flowchart LR
+    R[Right input] -->|drain| B["concat_batches'd build table"]
+    B --> H[HashMap of right keys]
+    L[Left input] -->|stream| P[probe loop]
+    H --> P
+    P -->|left_idx, right_idx| T[arrow::compute::take]
+    T --> O[output batch]
+```
+
+NULL keys never go in the hash table. SQL equi-join treats NULL as
+non-matching, so the probe side short-circuits the same way. Outer
+joins keep a per-build-row matched bitmap and emit unmatched rows
+NULL-padded via `new_null_array` after the probe finishes.
+
+Build a join with the DataFrame:
 
 ```rust
 let plan = scan_parquet_auto("fixtures/customers.parquet")?
@@ -267,14 +274,11 @@ let plan = scan_parquet_auto("fixtures/customers.parquet")?
     .filter(col("region").eq(lit("west")))?
     .project(vec![col("name"), col("amount")])?
     .into_plan();
-let optimized = Optimizer::default().optimize(plan)?;
 ```
 
-`cargo run -p plume-bench --example join_demo` shows two queries with
-their before/after plans. The first (above) does the optimization
-narrative — predicate pushdown splits the filter to the customers
-side, scan-pushdown attaches it as a row-group hint, and column
-pruning narrows each side independently:
+`cargo run -p plume-bench --example join_demo` runs that, plus a Left
+join with a right-side filter. The optimizer rewrites the inner-join
+plan three ways at once:
 
 ```
 BEFORE:                                    AFTER:
@@ -289,12 +293,31 @@ Projection: [name, amount]                 Projection: [name, amount]
                                                    projection=[customer_id, amount]
 ```
 
-The second demo is the load-bearing safety case. A `LEFT JOIN` with a
-filter on the right side's `amount` column: above the join the filter
-correctly drops the unmatched (NULL-padded) rows because `NULL > 500`
-is `NULL`, but pushing it through the join would cut the right input
-and cause the join to emit *more* unmatched rows with all-different
-left values. The optimizer does **not** push it:
+Predicate pushdown splits the filter to the customers side. Scan
+pushdown then attaches it as a row-group hint. Column pruning narrows
+each side independently: customers keeps `id, name, region` (filter +
+join key + output), orders keeps `customer_id, amount` (join key +
+output). Result table:
+
+```
++-------+--------------------+
+| name  | amount             |
++-------+--------------------+
+| carol | 734.2330818960052  |
+| alice | 817.5468823098956  |
+| dan   | 540.9708585589628  |
+| bob   | 832.2037180892002  |
+| heidi | 611.1012607203518  |
+| ...   | ...                |
++-------+--------------------+
+```
+
+The second demo is the case where the optimizer has to know when
+*not* to fire. A `LEFT JOIN` with `WHERE amount > 500` above it.
+Above the join, `amount` is NULL on unmatched rows and `NULL > 500`
+is `NULL`, so the filter correctly drops them. Push it through the
+join and the right input shrinks, the LEFT join emits a different
+set of unmatched rows, and the answer diverges. So it stays put:
 
 ```
 BEFORE:                                    AFTER:
@@ -302,34 +325,33 @@ Filter: (amount > 500)                     Filter: (amount > 500)
   LeftJoin: on=[id = customer_id]            LeftJoin: on=[id = customer_id]
     L: ParquetScan: customers                  L: ParquetScan: customers
     R: ParquetScan: orders                     R: ParquetScan: orders
-                                            (filter unchanged — outer-join safety)
 ```
 
-The full per-join-type pushdown safety table is a doc-comment on
-`push_filter_through_join` in
+The per-join-type pushdown decisions live as a table in the
+doc-comment on `push_filter_through_join` in
 [`crates/plume-optimizer/src/lib.rs`](crates/plume-optimizer/src/lib.rs).
-The DuckDB-diff `left_join_then_filter_on_right_amount_strips_nulls`
-test in `join_diff.rs` enforces the end-to-end answer; the plan-shape
-`left_join_does_not_push_right_only_predicate` test in
-`join_pushdown.rs` enforces the rule's decision.
+Two tests enforce them: `left_join_then_filter_on_right_amount_strips_nulls`
+in `join_diff.rs` checks the end-to-end answer matches DuckDB, and
+`left_join_does_not_push_right_only_predicate` in `join_pushdown.rs`
+checks the rule made the right call at the plan level.
 
 ## What's missing
 
 No SQL parser. Plans are Rust. The engine is the part worth building
 and SQL parsers are well-trod ground.
 
-No qualified columns / self-joins. Joins disambiguate colliding column
-names with a numeric suffix (`id`, `id_1`); referring to a column by
-qualifier (`customers.id`) isn't supported. Self-join would need
-qualified columns to be useful.
+No qualified columns or self-joins. Joins disambiguate name collisions
+with a numeric suffix (`id`, `id_1`). Referring to a column as
+`customers.id` isn't supported. Self-joins would need that to be
+useful.
 
-No sort-merge join. Hash join handles every shape supported here;
-sort-merge's edge is over-large build sides, which would need
-spill-to-disk, which is also out of scope.
+No sort-merge join. Hash join handles every shape supported here.
+Sort-merge would matter for build sides too big to fit in memory,
+which would also need spill-to-disk, which is also out of scope.
 
-No cost-based join reordering. Joins execute in the user's specified
-order. The optimizer reorders predicate positions across joins but
-not the joins themselves — that would need cardinality statistics.
+No cost-based join reordering. Joins execute in the order you write
+them. The optimizer reorders predicates across joins but not the
+joins themselves. Doing that needs cardinality statistics.
 
 The hash GROUP BY is row-at-a-time. Each row gets hashed into a key
 `Vec<KeyValue>`, looked up in a `HashMap`, and the per-aggregate
@@ -368,26 +390,22 @@ Things worth reading in order:
 - `crates/plume-core/src/expr.rs`: the `Expr` enum, type resolution,
   and the strict same-type comparison rule that rejects bad plans
   before they execute.
-- `crates/plume-core/src/plan.rs`: `LogicalPlan` (including the
-  `Join` variant), schema propagation per node, and the
-  collision-suffixing + nullability-widening rules for join output
-  schemas.
-- `crates/plume-exec/src/aggregate.rs`: the `Accumulator` trait,
-  six concrete impls, and the `HashAggregateExec` row-at-a-time
-  group-by loop. NULL key handling lives one module over in
-  `plume-exec/src/keys.rs` (shared with hash join).
-- `crates/plume-exec/src/join.rs`: `HashJoinExec` (build-then-probe
-  for Inner/Left/Right/Full/Semi/Anti) and `CrossJoinExec`. The
-  per-row decision-and-emission shape is laid out at the top of the
-  file; outer joins use a build-side matched bitmap and post-probe
-  unmatched emission via `arrow_array::new_null_array`.
-- `crates/plume-optimizer/src/lib.rs`: five rules in one file,
-  including the fixed-point driver. The `push_filter_through_join`
-  helper carries the join-aware safety table as a doc-comment;
-  reading it explains the asymmetry between Inner / Left / Right /
-  Full pushdown decisions.
-- `crates/plume-exec/src/operators.rs`: the `row_group_can_satisfy`
-  function with the per-operator pruning rules. The `Eq` case is one
-  line, the rest are similar.
+- `crates/plume-core/src/plan.rs`: `LogicalPlan` including the `Join`
+  variant. Schema propagation per node, plus the collision-suffix and
+  nullability-widening rules that make join output schemas trustworthy.
+- `crates/plume-exec/src/aggregate.rs`: the `Accumulator` trait, six
+  concrete impls, and the `HashAggregateExec` row-at-a-time group-by
+  loop. Key handling lives in `keys.rs` next door, shared with hash
+  join.
+- `crates/plume-exec/src/join.rs`: `HashJoinExec` for all six equi
+  shapes plus `CrossJoinExec`. The per-row decision matrix and the
+  three emission paths (matched, unmatched-left, left-only for
+  Semi/Anti) sit at the top of `execute()`.
+- `crates/plume-optimizer/src/lib.rs`: five rules and the fixed-point
+  driver. The `push_filter_through_join` doc-comment carries the full
+  per-join-type pushdown safety table.
+- `crates/plume-exec/src/operators.rs`: `row_group_can_satisfy` with
+  per-operator pruning rules. The `Eq` case is one line, the rest
+  similar.
 - `crates/plume-bench/src/harness.rs`: the diff harness. About 165
   lines, including the canonical-row renderer.
