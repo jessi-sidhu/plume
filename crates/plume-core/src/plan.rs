@@ -57,7 +57,7 @@ impl JoinType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanSource {
     /// CSV scans need a caller-supplied schema (CSV files have no embedded
     /// type info). Inference is a separate concern, deliberately left out.
@@ -83,7 +83,7 @@ impl ScanSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     Scan {
         source: ScanSource,

@@ -59,15 +59,22 @@ impl Optimizer {
 
     /// Apply every rule in order; repeat until a full pass changes nothing
     /// (or until `max_passes` is exhausted).
+    ///
+    /// Convergence is detected by `PartialEq` on the plan tree. The earlier
+    /// implementation rendered both sides to text and string-compared them;
+    /// once joins enter the picture, plans get bigger and the per-rule
+    /// `format!()` call grows linearly with plan size. Value comparison is
+    /// O(plan size) too but avoids the allocation, and "Display unchanged"
+    /// is not strictly the same invariant as "plan unchanged" — switching
+    /// to PartialEq is also more correct.
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let mut current = plan;
         for _ in 0..self.max_passes {
             let mut changed = false;
             for rule in &self.rules {
-                let before = format!("{}", current); // cheap text-form fingerprint
-                let after = rule.rewrite(current.clone())?;
-                let after_text = format!("{}", after);
-                if after_text != before {
+                let before = current.clone();
+                let after = rule.rewrite(current)?;
+                if after != before {
                     changed = true;
                 }
                 current = after;
@@ -174,24 +181,72 @@ fn prune_with_required(
             let pruned_input = prune_with_required(*input, required_from_above)?;
             Ok(LogicalPlan::limit(pruned_input, n))
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
-            // Phase 1 passthrough: do NOT prune across joins yet. Recurse
-            // into each side with that side's full schema as required, so
-            // the children come back schema-equal and the rebuilt Join
-            // has the same output schema. Cross-join pruning lands in
-            // the join-aware optimizer pass.
-            let left_required: HashSet<String> = left
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
-            let right_required: HashSet<String> = right
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
+        LogicalPlan::Join { left, right, on, filter, join_type, schema: out_schema } => {
+            // Required set splits across the join.
+            //
+            // For Semi/Anti the output schema is exactly the left input's,
+            // so a parent's required set lives entirely on the left side.
+            // For all other join types the output schema is left ++ right
+            // (with right-side collision suffixing). Walk the output schema
+            // by position: first n_left positions came from left at the
+            // same index; the rest came from right at (i - n_left). The
+            // output name and the source-side name may differ for the
+            // right side because of suffixing; we use the source-side
+            // name when registering it as required for the recursive call.
+            //
+            // On top of parent_required, each side must also keep:
+            //   - its half of the join keys
+            //   - any columns referenced by the residual filter that
+            //     belong to that side's schema
+            let left_schema = left.schema();
+            let right_schema = right.schema();
+            let n_left = left_schema.fields().len();
+
+            let mut left_required: HashSet<String> = HashSet::new();
+            let mut right_required: HashSet<String> = HashSet::new();
+
+            if join_type.projects_only_left() {
+                // Output is left-only; output names == left input names.
+                for f in out_schema.fields() {
+                    if required_from_above.contains(f.name()) {
+                        left_required.insert(f.name().clone());
+                    }
+                }
+            } else {
+                for (i, f) in out_schema.fields().iter().enumerate() {
+                    if !required_from_above.contains(f.name()) {
+                        continue;
+                    }
+                    if i < n_left {
+                        left_required.insert(left_schema.field(i).name().clone());
+                    } else {
+                        right_required
+                            .insert(right_schema.field(i - n_left).name().clone());
+                    }
+                }
+            }
+
+            for (l, r) in &on {
+                collect_columns(l, &mut left_required);
+                collect_columns(r, &mut right_required);
+            }
+            if filter.is_some() {
+                // Residual filter exprs reference the *output* schema
+                // (post-collision-suffixing). Splitting their column
+                // references back to source sides needs an output-name
+                // -> (side, source-name) mapping that today's plan node
+                // doesn't carry. Conservative fallback: keep every
+                // input column on each side. This path is reachable
+                // only if a future commit folds both-side preds into
+                // Join.filter (Phase 5 does not).
+                for f in left_schema.fields() {
+                    left_required.insert(f.name().clone());
+                }
+                for f in right_schema.fields() {
+                    right_required.insert(f.name().clone());
+                }
+            }
+
             let new_left = prune_with_required(*left, &left_required)?;
             let new_right = prune_with_required(*right, &right_required)?;
             LogicalPlan::join(new_left, new_right, on, filter, join_type)
@@ -237,6 +292,14 @@ impl OptimizerRule for PredicatePushdown {
 fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Filter { input, predicate, schema: _ } => {
+            // Filter sitting directly on a Join: split the predicate
+            // into AND-conjuncts and route each safely. This is the
+            // join-aware pushdown path; its safety rules are the
+            // load-bearing piece of the rule (see push_filter_through_join).
+            if matches!(*input, LogicalPlan::Join { .. }) {
+                return push_filter_through_join(*input, predicate);
+            }
+
             let pushed_input = push_through(*input)?;
             let pushable = collect_pushable(&predicate);
             let new_input = match (pushable.is_empty(), &pushed_input) {
@@ -273,15 +336,141 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
             Ok(LogicalPlan::limit(new_input, n))
         }
         LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
-            // Phase 1 passthrough: recurse into both children. Pushdown
-            // *across* joins (splitting AND-conjuncts above the join into
-            // left/right buckets, with outer-join nullable-side safety)
-            // is the load-bearing piece of Phase 5.
+            // Bare Join (no Filter on top): just recurse into both
+            // children so further pushdowns inside each subtree run.
             let new_left = push_through(*left)?;
             let new_right = push_through(*right)?;
             LogicalPlan::join(new_left, new_right, on, filter, join_type)
         }
     }
+}
+
+/// Handle the `Filter -> Join` shape: split the predicate into AND-conjuncts
+/// and route each conjunct based on which side(s) of the join it references
+/// and the join type's outer-join safety rules.
+///
+/// **Safety table** (which conjuncts can be pushed through which join):
+///
+/// |  Join type   | Left-only | Right-only | Both-side / no-side |
+/// |--------------|-----------|------------|---------------------|
+/// | Inner / Cross| push left | push right | stay above          |
+/// | Left         | push left | stay above | stay above          |
+/// | Right        | stay above| push right | stay above          |
+/// | Full         | stay above| stay above | stay above          |
+/// | Semi / Anti  | push left |    n/a     |   n/a               |
+///
+/// The "no" cases for outer joins are not stylistic — pushing a right-only
+/// predicate through a Left join would discard rows the outer join is
+/// supposed to preserve as NULL-padded. The classic counterexample is
+/// `right_col IS NULL`: above the Left join it matches the unmatched
+/// (NULL-padded) rows; pushed through to the right input it removes those
+/// right rows entirely, and the Left-join then produces *more* unmatched
+/// rows than the original query (with all-different left values), so the
+/// final result diverges. The Phase 3 `left_join_then_filter_on_right_amount_strips_nulls`
+/// diff test would catch a regression of this kind end-to-end; the
+/// plan-shape tests in this commit catch it at the rule level.
+///
+/// Both-side conjuncts on Inner could be folded into `Join.filter` (the
+/// plan layer accepts residuals on Inner/Cross), which would evaluate the
+/// predicate during the probe rather than after. That's a follow-up; for
+/// now both-side conjuncts stay above the join.
+fn push_filter_through_join(join: LogicalPlan, predicate: Expr) -> Result<LogicalPlan> {
+    let LogicalPlan::Join { left, right, on, filter, join_type, .. } = join else {
+        unreachable!("push_filter_through_join called on non-Join input")
+    };
+
+    let left_schema = left.schema();
+    let right_schema = right.schema();
+    let conjuncts = split_conjunction(&predicate);
+
+    let push_left_ok = pushes_into_left_through(join_type);
+    let push_right_ok = pushes_into_right_through(join_type);
+
+    let mut push_left: Vec<Expr> = Vec::new();
+    let mut push_right: Vec<Expr> = Vec::new();
+    let mut keep_above: Vec<Expr> = Vec::new();
+    for c in conjuncts {
+        let mut cols = HashSet::new();
+        collect_columns(&c, &mut cols);
+        let refs_left = cols.iter().any(|n| left_schema.field_with_name(n).is_ok());
+        let refs_right = cols.iter().any(|n| right_schema.field_with_name(n).is_ok());
+
+        if refs_left && !refs_right && push_left_ok {
+            push_left.push(c);
+        } else if refs_right && !refs_left && push_right_ok {
+            push_right.push(c);
+        } else {
+            keep_above.push(c);
+        }
+    }
+
+    // Build the new left subtree: if any conjuncts pushed, wrap left in
+    // a Filter and recurse so the wrapped predicate keeps pushing (e.g.
+    // into a Parquet scan).
+    let new_left = if push_left.is_empty() {
+        push_through(*left)?
+    } else {
+        let merged = combine_and(push_left);
+        push_through(LogicalPlan::filter(*left, merged)?)?
+    };
+    let new_right = if push_right.is_empty() {
+        push_through(*right)?
+    } else {
+        let merged = combine_and(push_right);
+        push_through(LogicalPlan::filter(*right, merged)?)?
+    };
+
+    let new_join = LogicalPlan::join(new_left, new_right, on, filter, join_type)?;
+    if keep_above.is_empty() {
+        Ok(new_join)
+    } else {
+        let merged = combine_and(keep_above);
+        LogicalPlan::filter(new_join, merged)
+    }
+}
+
+fn pushes_into_left_through(jt: plume_core::JoinType) -> bool {
+    use plume_core::JoinType::*;
+    matches!(jt, Inner | Cross | Left | Semi | Anti)
+}
+fn pushes_into_right_through(jt: plume_core::JoinType) -> bool {
+    use plume_core::JoinType::*;
+    matches!(jt, Inner | Cross | Right)
+}
+
+/// Split `expr` into its top-level AND-conjuncts. `(a AND b) AND c` ->
+/// `[a, b, c]`. Aliased AND nodes are unwrapped. Non-AND exprs return as
+/// a single-element vector.
+fn split_conjunction(expr: &Expr) -> Vec<Expr> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Alias { expr, .. } => walk(expr, out),
+            other => out.push(other.clone()),
+        }
+    }
+    walk(expr, &mut out);
+    out
+}
+
+/// Inverse of `split_conjunction`: build `a AND b AND c` from
+/// `[a, b, c]`. Single-element input returns the element; empty input
+/// is a programmer error (caller must check).
+fn combine_and(mut conjuncts: Vec<Expr>) -> Expr {
+    debug_assert!(!conjuncts.is_empty());
+    let mut acc = conjuncts.remove(0);
+    for c in conjuncts {
+        acc = Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::And,
+            right: Box::new(c),
+        };
+    }
+    acc
 }
 
 fn collect_pushable(e: &Expr) -> Vec<Expr> {
