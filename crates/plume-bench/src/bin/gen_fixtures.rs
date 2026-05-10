@@ -1,4 +1,4 @@
-//! Generate the two Week-1 fixtures into ./fixtures.
+//! Generate fixtures into ./fixtures.
 //!
 //! - people.csv: 10K rows. Mixed types, sprinkled nulls. Used by the trivial
 //!   harness tests and most early operator tests.
@@ -7,6 +7,13 @@
 //!   *within* each row group, with each row group covering a different price
 //!   band. This is deliberate: Week-9 row-group pruning needs row groups whose
 //!   min/max statistics actually skew, otherwise the pruning demo is a no-op.
+//!
+//! - customers.parquet / orders.parquet: small two-table fixture for join
+//!   testing. customers has ~200 rows with a sprinkling of NULL ids; orders
+//!   has ~500 rows with NULL customer_ids and a few orphan customer_ids
+//!   that don't exist in customers. Both have an `id` column on purpose so
+//!   the disambiguation path (id, id_1) is always exercised. Sized small
+//!   so cross-join tests can run on them without hammering the test loop.
 //!
 //! Run from the workspace root:
 //!     cargo run -p plume-bench --bin gen_fixtures
@@ -138,15 +145,112 @@ fn write_sales_parquet(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// ---- Join fixtures: customers + orders ---------------------------------
+
+const CUSTOMERS_ROWS: usize = 200;
+const ORDERS_ROWS: usize = 500;
+
+fn write_customers_parquet(path: &PathBuf) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),     // ~5% NULL
+        Field::new("name", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let mut rng = StdRng::seed_from_u64(0xCAFE_F00D);
+    let names = ["alice", "bob", "carol", "dan", "eve", "frank", "grace", "heidi"];
+    let regions = ["west", "east", "north", "south"];
+
+    let mut ids: Vec<Option<i64>> = Vec::with_capacity(CUSTOMERS_ROWS);
+    let mut name_col: Vec<&str> = Vec::with_capacity(CUSTOMERS_ROWS);
+    let mut region_col: Vec<&str> = Vec::with_capacity(CUSTOMERS_ROWS);
+    for i in 0..CUSTOMERS_ROWS {
+        // ~5% NULL ids — exercises the NULL-key short-circuit on the
+        // build side. The remaining ids are unique 1..=N.
+        ids.push(if rng.gen_bool(0.05) {
+            None
+        } else {
+            Some(i as i64 + 1)
+        });
+        name_col.push(names[rng.gen_range(0..names.len())]);
+        region_col.push(regions[rng.gen_range(0..regions.len())]);
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_col)),
+            Arc::new(StringArray::from(region_col)),
+        ],
+    )?;
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn write_orders_parquet(path: &PathBuf) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),    // collides with customers.id
+        Field::new("customer_id", DataType::Int64, true), // ~5% NULL, ~5% orphan
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Float64, false),
+    ]));
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+    let regions = ["west", "east", "north", "south"];
+
+    let mut order_ids: Vec<i64> = Vec::with_capacity(ORDERS_ROWS);
+    let mut customer_ids: Vec<Option<i64>> = Vec::with_capacity(ORDERS_ROWS);
+    let mut region_col: Vec<&str> = Vec::with_capacity(ORDERS_ROWS);
+    let mut amounts: Vec<f64> = Vec::with_capacity(ORDERS_ROWS);
+    for i in 0..ORDERS_ROWS {
+        order_ids.push(i as i64 + 1);
+        let cid = if rng.gen_bool(0.05) {
+            None
+        } else if rng.gen_bool(0.05) {
+            // Orphan: refers to a customer id that doesn't exist (way past
+            // the CUSTOMERS_ROWS range). Inner join must drop these.
+            Some(100_000 + i as i64)
+        } else {
+            Some(rng.gen_range(1..=CUSTOMERS_ROWS as i64))
+        };
+        customer_ids.push(cid);
+        region_col.push(regions[rng.gen_range(0..regions.len())]);
+        amounts.push(rng.gen_range(1.0_f64..1000.0_f64));
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(order_ids)),
+            Arc::new(Int64Array::from(customer_ids)),
+            Arc::new(StringArray::from(region_col)),
+            Arc::new(Float64Array::from(amounts)),
+        ],
+    )?;
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let dir = fixtures_dir()?;
     let people = dir.join("people.csv");
     let sales = dir.join("sales.parquet");
+    let customers = dir.join("customers.parquet");
+    let orders = dir.join("orders.parquet");
 
     println!("writing {}", people.display());
     write_people_csv(&people)?;
     println!("writing {} ({SALES_TOTAL} rows, {SALES_ROW_GROUPS} row groups)", sales.display());
     write_sales_parquet(&sales)?;
+    println!("writing {} ({CUSTOMERS_ROWS} rows)", customers.display());
+    write_customers_parquet(&customers)?;
+    println!("writing {} ({ORDERS_ROWS} rows)", orders.display());
+    write_orders_parquet(&orders)?;
     println!("done");
     Ok(())
 }

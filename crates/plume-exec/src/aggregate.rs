@@ -28,7 +28,7 @@ use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int32Type, Int64Type, UInt64Type};
+use arrow_array::types::{Float64Type, Int64Type, UInt64Type};
 use arrow_array::{
     new_null_array, Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
     UInt64Array,
@@ -38,6 +38,7 @@ use plume_core::{AggregateFunction, Expr};
 
 use crate::eval::{evaluate, EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::keys::{extract_key, KeyValue};
 
 // ------------------------------------------------------------------------
 // Trait
@@ -495,37 +496,6 @@ impl ExecutionPlan for AggregateExec {
 // HashMap's iteration order — undefined, so all diff tests use the
 // order-insensitive harness mode.
 // ------------------------------------------------------------------------
-
-/// Hashable, comparable representation of a group-key value. Float keys hash
-/// by bit pattern, which means two NaNs with the same bit pattern collapse
-/// into one group and otherwise form distinct ones. Documented; matches
-/// what most engines do for f64 GROUP BY.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum KeyValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(u64), // f64 -> bits
-    Str(String),
-}
-
-fn extract_key(arr: &ArrayRef, row: usize) -> EvalResult<KeyValue> {
-    if arr.is_null(row) {
-        return Ok(KeyValue::Null);
-    }
-    Ok(match arr.data_type() {
-        DataType::Boolean => KeyValue::Bool(arr.as_boolean().value(row)),
-        DataType::Int8 => KeyValue::Int(arr.as_primitive::<arrow_array::types::Int8Type>().value(row) as i64),
-        DataType::Int16 => KeyValue::Int(arr.as_primitive::<arrow_array::types::Int16Type>().value(row) as i64),
-        DataType::Int32 => KeyValue::Int(arr.as_primitive::<Int32Type>().value(row) as i64),
-        DataType::Int64 => KeyValue::Int(arr.as_primitive::<Int64Type>().value(row)),
-        DataType::Float32 => KeyValue::Float((arr.as_primitive::<arrow_array::types::Float32Type>().value(row) as f64).to_bits()),
-        DataType::Float64 => KeyValue::Float(arr.as_primitive::<Float64Type>().value(row).to_bits()),
-        DataType::Utf8 => KeyValue::Str(arr.as_string::<i32>().value(row).to_string()),
-        DataType::LargeUtf8 => KeyValue::Str(arr.as_string::<i64>().value(row).to_string()),
-        other => return Err(EvalError::NotImplemented(format!("group key over {other:?}"))),
-    })
-}
 
 /// Inverse of `extract_key` — assemble an `ArrayRef` of `target_dt` from the
 /// per-group key values for one column. Used at finalize time.

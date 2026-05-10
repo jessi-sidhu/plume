@@ -6,13 +6,13 @@
 
 use std::sync::Arc;
 
-use arrow::error::ArrowError;
 use arrow_array::RecordBatch;
-use plume_core::{LogicalPlan, ScanSource};
+use plume_core::{JoinType, LogicalPlan, ScanSource};
 
 use crate::aggregate::{AggregateExec, HashAggregateExec};
-use crate::eval::EvalResult;
+use crate::eval::{EvalError, EvalResult};
 use crate::exec::ExecutionPlan;
+use crate::join::{CrossJoinExec, HashJoinExec};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
@@ -70,16 +70,34 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                 ))
             }
         }
-        LogicalPlan::Join { join_type, .. } => {
-            // Join planning lands in the next commit (HashJoinExec /
-            // CrossJoinExec). For now the plan layer accepts joins so
-            // builder/schema/display work can ship independently; lowering
-            // a join to a physical plan still errors cleanly.
-            return Err(ArrowError::NotYetImplemented(format!(
-                "{} join lowering is not implemented yet",
-                join_type.name()
-            ))
-            .into());
+        LogicalPlan::Join { left, right, on, filter, join_type, schema } => {
+            let left_exec = create_physical_plan(left)?;
+            let right_exec = create_physical_plan(right)?;
+            match join_type {
+                JoinType::Cross => Arc::new(CrossJoinExec::new(
+                    left_exec,
+                    right_exec,
+                    filter.clone(),
+                    schema.clone(),
+                )),
+                JoinType::Inner => Arc::new(HashJoinExec::new(
+                    left_exec,
+                    right_exec,
+                    on.clone(),
+                    filter.clone(),
+                    *join_type,
+                    schema.clone(),
+                )),
+                // Outer joins land in the next commit; semi/anti the one
+                // after. Builder still accepts them so plan-level work can
+                // ship; lowering errors cleanly until the operator exists.
+                other => {
+                    return Err(EvalError::NotImplemented(format!(
+                        "{} join lowering is not implemented yet",
+                        other.name()
+                    )));
+                }
+            }
         }
     })
 }

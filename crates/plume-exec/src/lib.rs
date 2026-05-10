@@ -10,6 +10,8 @@ pub mod aggregate;
 pub mod compiled;
 pub mod eval;
 pub mod exec;
+pub mod join;
+pub mod keys;
 pub mod operators;
 pub mod parallel;
 pub mod planner;
@@ -17,6 +19,7 @@ pub mod planner;
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
+pub use join::{CrossJoinExec, HashJoinExec};
 pub use parallel::ParallelParquetScanExec;
 pub use exec::{BatchStream, ExecutionPlan};
 pub use operators::{
