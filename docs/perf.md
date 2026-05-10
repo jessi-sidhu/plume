@@ -40,6 +40,22 @@ runs are incremental.
 The unoptimized/optimized pairs are the resume number: they show the
 optimizer doing meaningful work on a measurable workload.
 
+### `joins/*` — hash join floor on a small workload
+
+| Bench                          | Plan                                                                                  | What it stresses                                                                |
+|--------------------------------|---------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| `inner_unoptimized`            | customers ⋈ orders on (id = customer_id)                                              | Build/probe overhead end-to-end on 200 × 500 rows                               |
+| `inner_optimized`              | optimize() applied to the same plan                                                   | Same — there's no Filter or projection to push, so identical to unoptimized     |
+| `left_with_filter_unoptimized` | LEFT JOIN with `WHERE amount > 500` above the join                                    | Outer-join NULL-padded emission + post-join Filter                              |
+| `left_with_filter_optimized`   | optimize() applied                                                                    | Same as unoptimized — pushdown rule must NOT push through the Left join         |
+
+These benches are deliberately small so they measure the operator-overhead
+floor (build hash, probe loop, take-based materialization) rather than
+parquet decode. The customers/orders fixture is 200 × 500; output is a
+few hundred rows. Characterising joins on a larger workload is follow-up
+work — these benches keep the harness exercising the join path without
+making `cargo bench` long.
+
 ### `expression_evaluator/*` — scalar evaluator hot path
 
 | Bench       | What it does                                                                                       |
@@ -83,6 +99,27 @@ calling `update_batch` once per row. That trades per-row HashMap traffic
 for per-group sub-batch construction; for high-cardinality groupings the
 crossover hurts, but for the typical low-cardinality case (8 distinct
 values for `region`) the speedup is large.
+
+For joins, the analogous knowns:
+
+1. **Build-side hash table construction** dominates when the right
+   input is large. Each row gets a `Vec<KeyValue>` allocation and a
+   HashMap insert; both are per-row. A vectorized build (hash whole
+   columns at once, group rows by key in a single pass) is the
+   standard fix — the same pattern as vectorized GROUP BY.
+2. **Probe-side per-row key extraction** has the same shape as build.
+3. **`take`-based output materialization** is one O(rows) Arrow kernel
+   call per emitted batch, not per row, so it's already cheap.
+4. **Outer-join post-probe emission** walks the matched-bitmap once
+   and gathers via `take`. Linear in build-side row count.
+5. **`new_null_array` for NULL-padded sides** is constant-time per
+   call — it builds an Arrow array with a NULL buffer the right
+   length and no value buffer.
+
+The current join benches (`joins/*`) are too small to make any of
+this measurable end-to-end. A 1M-row joined workload would put
+build-side hashing at the top of the hot list, well above probe work
+and well above the optimizer-pushed predicate evaluation.
 
 ## Reading criterion output
 

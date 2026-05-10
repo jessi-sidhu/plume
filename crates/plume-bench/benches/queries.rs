@@ -30,15 +30,19 @@ use arrow_array::{Float64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use plume_core::{avg, col, count_star, lit, sum, Expr};
+use plume_core::{avg, col, count_star, lit, sum, Expr, JoinType};
 use plume_exec::{collect, compile, evaluate};
 use plume_io::scan_parquet_auto;
 use plume_optimizer::Optimizer;
 
 fn sales_path() -> Option<PathBuf> {
+    fixture_path("sales.parquet")
+}
+
+fn fixture_path(name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
-        .join("fixtures/sales.parquet");
+        .join("fixtures").join(name);
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
         return None;
@@ -158,5 +162,78 @@ fn bench_evaluator(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_pipelines, bench_evaluator);
+// =======================================================================
+// Joins benches.
+//
+// The customers/orders fixtures are deliberately small (200 x 500), so
+// these benches measure the operator-overhead floor — build/probe loop
+// cost on a workload where parquet decode is negligible. They're here
+// to keep the bench harness exercising the join code path; characterising
+// joins on a larger workload is follow-up work.
+// =======================================================================
+
+fn build_inner_join_plan(
+    customers: &std::path::Path,
+    orders: &std::path::Path,
+) -> plume_core::LogicalPlan {
+    scan_parquet_auto(customers)
+        .unwrap()
+        .join(
+            scan_parquet_auto(orders).unwrap(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .into_plan()
+}
+
+fn build_left_join_with_filter_plan(
+    customers: &std::path::Path,
+    orders: &std::path::Path,
+) -> plume_core::LogicalPlan {
+    // Filter on right-side amount above a LEFT join — the optimizer
+    // must keep it above (the safety case). Bench measures the
+    // post-join Filter cost on outer-join output (NULL-padded rows).
+    scan_parquet_auto(customers)
+        .unwrap()
+        .join(
+            scan_parquet_auto(orders).unwrap(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Left,
+        )
+        .unwrap()
+        .filter(col("amount").gt(lit(500.0_f64)))
+        .unwrap()
+        .into_plan()
+}
+
+fn bench_joins(c: &mut Criterion) {
+    let Some(customers) = fixture_path("customers.parquet") else { return };
+    let Some(orders) = fixture_path("orders.parquet") else { return };
+
+    let mut group = c.benchmark_group("joins");
+    group.sample_size(50);
+
+    let inner = build_inner_join_plan(&customers, &orders);
+    let inner_opt = Optimizer::default().optimize(inner.clone()).unwrap();
+    group.bench_function("inner_unoptimized", |b| {
+        b.iter(|| black_box(collect(&inner).unwrap()))
+    });
+    group.bench_function("inner_optimized", |b| {
+        b.iter(|| black_box(collect(&inner_opt).unwrap()))
+    });
+
+    let left_filt = build_left_join_with_filter_plan(&customers, &orders);
+    let left_filt_opt = Optimizer::default().optimize(left_filt.clone()).unwrap();
+    group.bench_function("left_with_filter_unoptimized", |b| {
+        b.iter(|| black_box(collect(&left_filt).unwrap()))
+    });
+    group.bench_function("left_with_filter_optimized", |b| {
+        b.iter(|| black_box(collect(&left_filt_opt).unwrap()))
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_pipelines, bench_evaluator, bench_joins);
 criterion_main!(benches);
