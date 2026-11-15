@@ -240,8 +240,8 @@ def findings(df, on, env):
     noise = (100.0 * (r_on - r_off).abs() / r_off).max()
     out.append(
         "- **Timing noise:** on the random layout nothing is pruned, so off and on do the same "
-        "work. Their medians still differ by up to {}, so small time differences here don't "
-        "mean much. The byte and row-group counts are exact.".format(pct(noise))
+        "work. Their medians differ by up to {}, which is a rough measure of timing noise "
+        "on this machine. Byte and row-group counts don't vary between runs.".format(pct(noise))
     )
 
     faster = int((on["duckdb_ms"] < on["plume_ms"]).sum())
