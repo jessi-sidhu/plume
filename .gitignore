@@ -7,3 +7,7 @@ perf.data*
 # Generated fixtures are large; rebuild via `cargo run -p plume-bench --bin gen_fixtures`.
 /fixtures/*.csv
 /fixtures/*.parquet
+
+# Phase 1 datasets (TPC-H, NYC taxi) are large and downloaded/generated;
+# rebuild via `cargo run --release -p plume-bench --bin prepare_datasets`.
+/data/

@@ -1299,6 +1299,7 @@ dependencies = [
  "plume-io",
  "plume-optimizer",
  "rand",
+ "serde_json",
  "tempfile",
 ]
 

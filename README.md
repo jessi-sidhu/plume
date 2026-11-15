@@ -367,6 +367,12 @@ can prove `col != lit` is always false only if the entire row group
 equals `lit`, which they don't track cheaply. The optimizer collects
 the predicate but the row-group filter ignores `NotEq`.
 
+No DECIMAL type. The Phase 1 datasets (TPC-H, NYC taxi) have DECIMAL
+money columns, so `prepare_datasets` casts every DECIMAL column to
+DOUBLE on export and records which columns it cast in
+`data/manifest.json`. Sums over those columns can differ from exact
+decimal arithmetic in the last few bits.
+
 Float `NaN` in row-group min/max disables pruning for that group.
 Comparing against `NaN` returns `false` for every operator, so a
 `NaN` bound would silently skip groups that should have been kept.
@@ -378,6 +384,7 @@ cargo build --workspace                            # ~3-5 min cold (bundled Duck
 cargo run -p plume-bench --bin gen_fixtures        # CSV + parquet fixtures (incl. customers/orders for joins)
 cargo test --workspace                             # 208 tests
 cargo run -p plume-bench --example join_demo       # or optimizer_demo / csv_aggregate / parquet_filter / group_by_pipeline
+cargo run --release -p plume-bench --bin prepare_datasets   # Phase 1 data: TPC-H SF1 + NYC taxi Jan-Jun 2023 into data/ (gitignored)
 ```
 
 For benchmark methodology and how to interpret `cargo bench` output,
