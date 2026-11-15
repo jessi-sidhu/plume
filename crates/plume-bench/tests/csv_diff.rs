@@ -50,10 +50,16 @@ fn diff_pipeline(df: DataFrame, csv: &Path, sql: &str) -> Result<()> {
 
 #[test]
 fn select_all_columns() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema()).project(vec![
-            col("id"), col("name"), col("age"), col("region"), col("score"),
+            col("id"),
+            col("name"),
+            col("age"),
+            col("region"),
+            col("score"),
         ])?,
         &csv,
         "SELECT id, name, age, region, score FROM people",
@@ -62,10 +68,11 @@ fn select_all_columns() -> Result<()> {
 
 #[test]
 fn project_subset_two_columns() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
-        DataFrame::scan_csv(&csv, people_schema())
-            .project(vec![col("id"), col("name")])?,
+        DataFrame::scan_csv(&csv, people_schema()).project(vec![col("id"), col("name")])?,
         &csv,
         "SELECT id, name FROM people",
     )
@@ -73,7 +80,9 @@ fn project_subset_two_columns() -> Result<()> {
 
 #[test]
 fn filter_age_greater_than_30() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
             .filter(col("age").gt(lit(30_i32)))?
@@ -85,7 +94,9 @@ fn filter_age_greater_than_30() -> Result<()> {
 
 #[test]
 fn filter_string_equality_against_literal() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
             .filter(col("region").eq(lit("west")))?
@@ -97,10 +108,16 @@ fn filter_string_equality_against_literal() -> Result<()> {
 
 #[test]
 fn filter_compound_predicate_with_and() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
-            .filter(col("age").gt(lit(50_i32)).and(col("region").eq(lit("east"))))?
+            .filter(
+                col("age")
+                    .gt(lit(50_i32))
+                    .and(col("region").eq(lit("east"))),
+            )?
             .project(vec![col("id"), col("name"), col("age"), col("region")])?,
         &csv,
         "SELECT id, name, age, region FROM people WHERE age > 50 AND region = 'east'",
@@ -109,7 +126,9 @@ fn filter_compound_predicate_with_and() -> Result<()> {
 
 #[test]
 fn filter_float_comparison_with_nulls() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     // score has ~3% nulls; `score > 90.0` must skip them per three-valued logic.
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
@@ -122,7 +141,9 @@ fn filter_float_comparison_with_nulls() -> Result<()> {
 
 #[test]
 fn limit_after_filter() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
             .filter(col("region").neq(lit("east")))?
@@ -135,11 +156,16 @@ fn limit_after_filter() -> Result<()> {
 
 #[test]
 fn projection_with_arithmetic() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_pipeline(
         DataFrame::scan_csv(&csv, people_schema())
-            .filter(col("age").gt_eq(lit(0_i32)))?  // drop NULL ages so DuckDB's CAST agrees row-for-row
-            .project(vec![col("id"), col("age").plus(lit(10_i32)).alias("age_plus_10")])?,
+            .filter(col("age").gt_eq(lit(0_i32)))? // drop NULL ages so DuckDB's CAST agrees row-for-row
+            .project(vec![
+                col("id"),
+                col("age").plus(lit(10_i32)).alias("age_plus_10"),
+            ])?,
         &csv,
         "SELECT id, age + 10 AS age_plus_10 FROM people WHERE age >= 0",
     )

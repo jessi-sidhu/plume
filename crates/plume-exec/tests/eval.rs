@@ -20,8 +20,20 @@ fn ints_with_nulls() -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)])),
-            Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40), Some(5)])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                None,
+                Some(4),
+                Some(5),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                None,
+                Some(30),
+                Some(40),
+                Some(5),
+            ])),
         ],
     )
     .unwrap()
@@ -34,11 +46,34 @@ fn bools_for_kleene() -> RecordBatch {
         Field::new("a", DataType::Boolean, true),
         Field::new("b", DataType::Boolean, true),
     ]));
-    let a = vec![Some(true), Some(true), None, Some(false), Some(false), None, None, Some(true), Some(false)];
-    let b = vec![Some(true), Some(false), Some(true), Some(true), Some(false), Some(false), None, None, None];
+    let a = vec![
+        Some(true),
+        Some(true),
+        None,
+        Some(false),
+        Some(false),
+        None,
+        None,
+        Some(true),
+        Some(false),
+    ];
+    let b = vec![
+        Some(true),
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+        Some(false),
+        None,
+        None,
+        None,
+    ];
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(BooleanArray::from(a)), Arc::new(BooleanArray::from(b))],
+        vec![
+            Arc::new(BooleanArray::from(a)),
+            Arc::new(BooleanArray::from(b)),
+        ],
     )
     .unwrap()
 }
@@ -170,7 +205,15 @@ fn and_kleene_truth_table_matches_sql() {
     let batch = bools_for_kleene();
     let out = evaluate_predicate(&col("a").and(col("b")), &batch).unwrap();
     let expected = BooleanArray::from(vec![
-        Some(true), Some(false), None, Some(false), Some(false), Some(false), None, None, Some(false),
+        Some(true),
+        Some(false),
+        None,
+        Some(false),
+        Some(false),
+        Some(false),
+        None,
+        None,
+        Some(false),
     ]);
     assert_eq!(&out, &expected);
 }
@@ -183,7 +226,15 @@ fn or_kleene_truth_table_matches_sql() {
     let batch = bools_for_kleene();
     let out = evaluate_predicate(&col("a").or(col("b")), &batch).unwrap();
     let expected = BooleanArray::from(vec![
-        Some(true), Some(true), Some(true), Some(true), Some(false), None, None, Some(true), None,
+        Some(true),
+        Some(true),
+        Some(true),
+        Some(true),
+        Some(false),
+        None,
+        None,
+        Some(true),
+        None,
     ]);
     assert_eq!(&out, &expected);
 }
@@ -193,14 +244,20 @@ fn alias_is_transparent_in_eval() {
     let batch = ints_with_nulls();
     let out = evaluate(&col("a").alias("renamed"), &batch).unwrap();
     let direct = evaluate(&col("a"), &batch).unwrap();
-    assert_eq!(out.as_primitive::<Int32Type>(), direct.as_primitive::<Int32Type>());
+    assert_eq!(
+        out.as_primitive::<Int32Type>(),
+        direct.as_primitive::<Int32Type>()
+    );
 }
 
 #[test]
 fn predicate_check_rejects_non_boolean_result() {
     let batch = ints_with_nulls();
     let err = evaluate_predicate(&col("a"), &batch).unwrap_err();
-    assert!(matches!(err, EvalError::PredicateNotBoolean(DataType::Int32)));
+    assert!(matches!(
+        err,
+        EvalError::PredicateNotBoolean(DataType::Int32)
+    ));
 }
 
 #[test]
@@ -231,11 +288,8 @@ fn string_equality_works() {
 #[test]
 fn int64_round_trip_preserves_value() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))]).unwrap();
     let out = evaluate(&col("id").plus(lit(100_i64)), &batch).unwrap();
     let arr = out.as_primitive::<Int64Type>();
     assert_eq!(arr.value(2), 103);

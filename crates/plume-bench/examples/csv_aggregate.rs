@@ -29,7 +29,10 @@ fn people_schema() -> SchemaRef {
 
 fn main() -> Result<()> {
     let csv = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/people.csv");
     if !csv.exists() {
         eprintln!(

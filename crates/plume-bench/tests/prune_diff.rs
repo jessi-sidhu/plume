@@ -13,7 +13,10 @@ use plume_optimizer::prune_columns;
 
 fn sales_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/sales.parquet");
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
@@ -51,7 +54,9 @@ fn diff_three_ways_ordered(plan: LogicalPlan, p: &Path, sql: &str) -> Result<()>
 #[test]
 fn projection_alone() -> Result<()> {
     let Some(p) = sales_path() else { return Ok(()) };
-    let plan = df(&p).project(vec![col("category"), col("price")])?.into_plan();
+    let plan = df(&p)
+        .project(vec![col("category"), col("price")])?
+        .into_plan();
     diff_three_ways_ordered(plan, &p, "SELECT category, price FROM sales")
 }
 
@@ -63,7 +68,8 @@ fn filter_then_project_two_cols() -> Result<()> {
         .project(vec![col("category"), col("price")])?
         .into_plan();
     diff_three_ways_ordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT category, price FROM sales WHERE region = 'west'",
     )
 }
@@ -74,11 +80,15 @@ fn group_by_with_two_aggregates_prunes_to_three_cols() -> Result<()> {
     let plan = df(&p)
         .aggregate(
             vec![col("region")],
-            vec![avg(col("price")).alias("avg_price"), sum(col("quantity")).alias("total_qty")],
+            vec![
+                avg(col("price")).alias("avg_price"),
+                sum(col("quantity")).alias("total_qty"),
+            ],
         )?
         .into_plan();
     diff_three_ways_unordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT region, AVG(price) AS avg_price, SUM(quantity) AS total_qty \
          FROM sales GROUP BY region",
     )
@@ -87,7 +97,9 @@ fn group_by_with_two_aggregates_prunes_to_three_cols() -> Result<()> {
 #[test]
 fn count_star_prunes_to_one_column() -> Result<()> {
     let Some(p) = sales_path() else { return Ok(()) };
-    let plan = df(&p).aggregate(vec![], vec![count_star().alias("n")])?.into_plan();
+    let plan = df(&p)
+        .aggregate(vec![], vec![count_star().alias("n")])?
+        .into_plan();
     diff_three_ways_ordered(plan, &p, "SELECT COUNT(*) AS n FROM sales")
 }
 
@@ -98,11 +110,15 @@ fn full_aggregate_pipeline_with_filter_and_group_by() -> Result<()> {
         .filter(col("price").gt(lit(500.0_f64)))?
         .aggregate(
             vec![col("category")],
-            vec![count_star().alias("n"), avg(col("price")).alias("avg_price")],
+            vec![
+                count_star().alias("n"),
+                avg(col("price")).alias("avg_price"),
+            ],
         )?
         .into_plan();
     diff_three_ways_unordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT category, COUNT(*) AS n, AVG(price) AS avg_price \
          FROM sales WHERE price > 500.0 GROUP BY category",
     )

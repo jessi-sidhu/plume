@@ -17,7 +17,10 @@ use plume_optimizer::Optimizer;
 
 fn main() -> Result<()> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/sales.parquet");
     if !p.exists() {
         eprintln!(
@@ -51,7 +54,8 @@ fn main() -> Result<()> {
     let plain_rows: usize = plain.execute()?.map(|b| b.unwrap().num_rows()).sum();
 
     let pushed: Arc<dyn ExecutionPlan> = Arc::new(
-        ParquetScanExec::new(p, schema).with_pushdown_predicates(vec![col("price").gt(lit(950.0_f64))]),
+        ParquetScanExec::new(p, schema)
+            .with_pushdown_predicates(vec![col("price").gt(lit(950.0_f64))]),
     );
     let pushed_rows: usize = pushed.execute()?.map(|b| b.unwrap().num_rows()).sum();
 

@@ -8,9 +8,7 @@ use arrow_array::types::Int32Type;
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use plume_core::{col, lit};
-use plume_exec::{
-    collect, ExecutionPlan, FilterExec, LimitExec, MemoryExec, ProjectionExec,
-};
+use plume_exec::{collect, ExecutionPlan, FilterExec, LimitExec, MemoryExec, ProjectionExec};
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -33,7 +31,10 @@ fn batch(ids: &[i32], names: &[&str], ages: Vec<Option<i32>>) -> RecordBatch {
 }
 
 fn drain(exec: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
-    exec.execute().unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    exec.execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 #[test]
@@ -47,13 +48,23 @@ fn memory_exec_round_trips_input_batches() {
 
 #[test]
 fn filter_exec_drops_non_matching_rows_and_propagates_nulls() {
-    let b = batch(&[1, 2, 3, 4], &["a", "b", "c", "d"], vec![Some(20), None, Some(40), Some(50)]);
+    let b = batch(
+        &[1, 2, 3, 4],
+        &["a", "b", "c", "d"],
+        vec![Some(20), None, Some(40), Some(50)],
+    );
     let mem: Arc<dyn ExecutionPlan> = Arc::new(MemoryExec::new(vec![b], schema()));
     let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::new(mem, col("age").gt(lit(25_i32))));
     let out = drain(filter);
     let ids: Vec<i32> = out
         .iter()
-        .flat_map(|b| b.column_by_name("id").unwrap().as_primitive::<Int32Type>().iter().flatten())
+        .flat_map(|b| {
+            b.column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .iter()
+                .flatten()
+        })
         .collect();
     // age > 25: id=3 (40), id=4 (50). id=2 (NULL) is dropped (NULL is not true).
     assert_eq!(ids, vec![3, 4]);
@@ -65,12 +76,18 @@ fn projection_exec_reorders_and_renames_columns() {
     let mem: Arc<dyn ExecutionPlan> = Arc::new(MemoryExec::new(vec![b], schema()));
     // Build via DataFrame so the schema math is the same path the planner uses.
     let df = plume_core::DataFrame::scan_csv("ignored", schema())
-        .project(vec![col("name").alias("who"), col("age").plus(lit(1_i32)).alias("age_next")])
+        .project(vec![
+            col("name").alias("who"),
+            col("age").plus(lit(1_i32)).alias("age_next"),
+        ])
         .unwrap();
     let proj_schema = df.schema();
     let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::new(
         mem,
-        vec![col("name").alias("who"), col("age").plus(lit(1_i32)).alias("age_next")],
+        vec![
+            col("name").alias("who"),
+            col("age").plus(lit(1_i32)).alias("age_next"),
+        ],
         proj_schema.clone(),
     ));
     let out = drain(proj);
@@ -114,8 +131,10 @@ fn collect_runs_a_csv_scan_filter_project_pipeline() {
     drop(f);
 
     let plan = plume_core::DataFrame::scan_csv(&path, schema())
-        .filter(col("age").gt_eq(lit(30_i32))).unwrap()
-        .project(vec![col("name")]).unwrap()
+        .filter(col("age").gt_eq(lit(30_i32)))
+        .unwrap()
+        .project(vec![col("name")])
+        .unwrap()
         .into_plan();
 
     let batches = collect(&plan).unwrap();

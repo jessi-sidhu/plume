@@ -22,7 +22,10 @@ use plume_optimizer::optimize;
 
 fn sales_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/sales.parquet");
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
@@ -58,7 +61,8 @@ fn highly_selective_float_predicate_round_trips() -> Result<()> {
         .project(vec![col("order_id"), col("price")])?
         .into_plan();
     diff_three_ways_ordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT order_id, price FROM sales WHERE price > 950.0",
     )
 }
@@ -72,7 +76,8 @@ fn medium_selective_float_predicate_round_trips() -> Result<()> {
         .aggregate(vec![col("region")], vec![count_star().alias("n")])?
         .into_plan();
     diff_three_ways_unordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT region, COUNT(*) AS n FROM sales WHERE price > 500.0 GROUP BY region",
     )
 }
@@ -87,7 +92,8 @@ fn string_eq_predicate_round_trips() -> Result<()> {
         .project(vec![col("order_id"), col("region"), col("price")])?
         .into_plan();
     diff_three_ways_ordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT order_id, region, price FROM sales WHERE region = 'west'",
     )
 }
@@ -97,11 +103,16 @@ fn conjunction_round_trips() -> Result<()> {
     // (price > 600) AND (region = 'east')
     let Some(p) = sales_path() else { return Ok(()) };
     let plan = scan_parquet_auto(&p)?
-        .filter(col("price").gt(lit(600.0_f64)).and(col("region").eq(lit("east"))))?
+        .filter(
+            col("price")
+                .gt(lit(600.0_f64))
+                .and(col("region").eq(lit("east"))),
+        )?
         .aggregate(vec![], vec![sum(col("quantity")).alias("total_qty")])?
         .into_plan();
     diff_three_ways_ordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT SUM(quantity) AS total_qty FROM sales WHERE price > 600.0 AND region = 'east'",
     )
 }
@@ -122,8 +133,7 @@ fn pushdown_demonstrably_skips_row_groups() -> Result<()> {
 
     let predicate = col("price").gt(lit(950.0_f64));
     let pruned: Arc<dyn ExecutionPlan> = Arc::new(
-        ParquetScanExec::new(p.clone(), schema.clone())
-            .with_pushdown_predicates(vec![predicate]),
+        ParquetScanExec::new(p.clone(), schema.clone()).with_pushdown_predicates(vec![predicate]),
     );
     let pruned_rows: usize = pruned.execute()?.map(|b| b.unwrap().num_rows()).sum();
     // Sales fixture: 8 row groups of 125K rows each, prices in disjoint
@@ -155,7 +165,8 @@ fn missing_stats_does_not_prune_aggressively() -> Result<()> {
         .aggregate(vec![], vec![count_star().alias("n")])?
         .into_plan();
     diff_three_ways_ordered(
-        plan, &p,
+        plan,
+        &p,
         "SELECT COUNT(*) AS n FROM sales WHERE quantity > 5",
     )
 }

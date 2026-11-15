@@ -17,7 +17,13 @@ use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, Proj
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
     Ok(match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => match source {
+        LogicalPlan::Scan {
+            source,
+            schema,
+            projection,
+            pushdown_predicates,
+            limit,
+        } => match source {
             ScanSource::Csv { path } => {
                 // CSV: pruning + pushdown don't apply; limit does (cheap to
                 // truncate the iterator). Build the plain CsvScanExec, wrap
@@ -30,11 +36,9 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
             ScanSource::Parquet { path } => {
                 let mut exec = match projection {
                     None => ParquetScanExec::new(path.clone(), schema.clone()),
-                    Some(cols) => ParquetScanExec::with_projection(
-                        path.clone(),
-                        schema.clone(),
-                        cols.clone(),
-                    ),
+                    Some(cols) => {
+                        ParquetScanExec::with_projection(path.clone(), schema.clone(), cols.clone())
+                    }
                 };
                 if !pushdown_predicates.is_empty() {
                     exec = exec.with_pushdown_predicates(pushdown_predicates.clone());
@@ -45,11 +49,17 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                 Arc::new(exec)
             }
         },
-        LogicalPlan::Filter { input, predicate, .. } => {
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
             let child = create_physical_plan(input)?;
             Arc::new(FilterExec::new(child, predicate.clone()))
         }
-        LogicalPlan::Projection { input, exprs, schema } => {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } => {
             let child = create_physical_plan(input)?;
             Arc::new(ProjectionExec::new(child, exprs.clone(), schema.clone()))
         }
@@ -57,7 +67,12 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
             let child = create_physical_plan(input)?;
             Arc::new(LimitExec::new(child, *n))
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema,
+        } => {
             let child = create_physical_plan(input)?;
             if group_exprs.is_empty() {
                 Arc::new(AggregateExec::new(child, agg_exprs.clone(), schema.clone()))
@@ -70,7 +85,14 @@ pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionP
                 ))
             }
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, schema } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            schema,
+        } => {
             let left_exec = create_physical_plan(left)?;
             let right_exec = create_physical_plan(right)?;
             match join_type {

@@ -197,11 +197,11 @@ impl LogicalPlan {
     ) -> Result<Self> {
         let mut fields = Vec::with_capacity(cols.len());
         for name in &cols {
-            let f = full_schema
-                .field_with_name(name)
-                .map_err(|_| PlumeError::Schema(format!(
+            let f = full_schema.field_with_name(name).map_err(|_| {
+                PlumeError::Schema(format!(
                     "scan_with_projection: column `{name}` not in source schema"
-                )))?;
+                ))
+            })?;
             fields.push(f.clone());
         }
         let projected_schema = Arc::new(Schema::new(fields));
@@ -218,7 +218,13 @@ impl LogicalPlan {
     /// projection / limit. Used by the predicate-pushdown optimizer (Week 9).
     pub fn with_pushdown_predicates(plan: LogicalPlan, predicates: Vec<Expr>) -> Result<Self> {
         match plan {
-            LogicalPlan::Scan { source, schema, projection, limit, .. } => Ok(LogicalPlan::Scan {
+            LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                limit,
+                ..
+            } => Ok(LogicalPlan::Scan {
                 source,
                 schema,
                 projection,
@@ -235,15 +241,19 @@ impl LogicalPlan {
     /// (Week 10).
     pub fn with_scan_limit(plan: LogicalPlan, limit: Option<usize>) -> Result<Self> {
         match plan {
-            LogicalPlan::Scan { source, schema, projection, pushdown_predicates, .. } => {
-                Ok(LogicalPlan::Scan {
-                    source,
-                    schema,
-                    projection,
-                    pushdown_predicates,
-                    limit,
-                })
-            }
+            LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                pushdown_predicates,
+                ..
+            } => Ok(LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                pushdown_predicates,
+                limit,
+            }),
             _ => Err(PlumeError::Plan(
                 "with_scan_limit: target plan must be a Scan".into(),
             )),
@@ -260,15 +270,25 @@ impl LogicalPlan {
         }
         // Filter preserves input schema (same fields, same nullability —
         // filter cannot make a non-null column nullable).
-        Ok(LogicalPlan::Filter { schema: in_schema.clone(), input: Box::new(input), predicate })
+        Ok(LogicalPlan::Filter {
+            schema: in_schema.clone(),
+            input: Box::new(input),
+            predicate,
+        })
     }
 
     pub fn project(input: LogicalPlan, exprs: Vec<Expr>) -> Result<Self> {
         if exprs.is_empty() {
-            return Err(PlumeError::Plan("projection requires at least one expression".into()));
+            return Err(PlumeError::Plan(
+                "projection requires at least one expression".into(),
+            ));
         }
         let schema = fields_for(&input.schema(), &exprs)?;
-        Ok(LogicalPlan::Projection { input: Box::new(input), exprs, schema })
+        Ok(LogicalPlan::Projection {
+            input: Box::new(input),
+            exprs,
+            schema,
+        })
     }
 
     pub fn aggregate(
@@ -296,16 +316,26 @@ impl LogicalPlan {
         let agg_fields = fields_for(&in_schema, &agg_exprs)?;
         // Output: group columns first (preserves user-visible column order),
         // then aggregate columns. Combined into one schema.
-        let mut combined = Vec::with_capacity(group_fields.fields().len() + agg_fields.fields().len());
+        let mut combined =
+            Vec::with_capacity(group_fields.fields().len() + agg_fields.fields().len());
         combined.extend(group_fields.fields().iter().map(|f| (**f).clone()));
         combined.extend(agg_fields.fields().iter().map(|f| (**f).clone()));
         let schema = Arc::new(Schema::new(combined));
-        Ok(LogicalPlan::Aggregate { input: Box::new(input), group_exprs, agg_exprs, schema })
+        Ok(LogicalPlan::Aggregate {
+            input: Box::new(input),
+            group_exprs,
+            agg_exprs,
+            schema,
+        })
     }
 
     pub fn limit(input: LogicalPlan, n: usize) -> Self {
         let schema = input.schema();
-        LogicalPlan::Limit { input: Box::new(input), n, schema }
+        LogicalPlan::Limit {
+            input: Box::new(input),
+            n,
+            schema,
+        }
     }
 
     /// Construct a Join plan node. Validates each `(l, r)` key pair against
@@ -326,9 +356,7 @@ impl LogicalPlan {
         match join_type {
             JoinType::Cross => {
                 if !on.is_empty() {
-                    return Err(PlumeError::Plan(
-                        "cross join takes no equi-keys".into(),
-                    ));
+                    return Err(PlumeError::Plan("cross join takes no equi-keys".into()));
                 }
             }
             _ => {
@@ -371,13 +399,10 @@ impl LogicalPlan {
                 )));
             }
             // Outer joins don't accept residuals here. They turn into
-                // semantics-changing pushdowns; the optimizer is responsible
-                // for not folding both-side predicates into outer-join
-                // residuals. Catch caller mistakes early.
-            if matches!(
-                join_type,
-                JoinType::Left | JoinType::Right | JoinType::Full
-            ) {
+            // semantics-changing pushdowns; the optimizer is responsible
+            // for not folding both-side predicates into outer-join
+            // residuals. Catch caller mistakes early.
+            if matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full) {
                 return Err(PlumeError::Plan(format!(
                     "{} join does not accept a residual filter; \
                      wrap the join in an outer Filter instead",
@@ -437,11 +462,7 @@ fn types_equi_compatible(l: &DataType, r: &DataType) -> bool {
 /// - Nullability widens for the side the join may emit unmatched-row NULLs
 ///   for: Right/Full make left columns nullable; Left/Full make right
 ///   columns nullable. (Inner / Cross preserve input nullability.)
-fn concat_schema(
-    left: &Schema,
-    right: &Schema,
-    join_type: JoinType,
-) -> Result<SchemaRef> {
+fn concat_schema(left: &Schema, right: &Schema, join_type: JoinType) -> Result<SchemaRef> {
     if join_type.projects_only_left() {
         return Ok(Arc::new(left.clone()));
     }
@@ -486,7 +507,13 @@ fn disambiguate(name: &str, used: &std::collections::HashSet<String>) -> String 
 fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Result {
     let pad = "  ".repeat(depth);
     match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => {
+        LogicalPlan::Scan {
+            source,
+            schema,
+            projection,
+            pushdown_predicates,
+            limit,
+        } => {
             match projection {
                 None => write!(
                     out,
@@ -504,8 +531,10 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
                 )?,
             }
             if !pushdown_predicates.is_empty() {
-                let preds: Vec<String> =
-                    pushdown_predicates.iter().map(|p| p.display_name()).collect();
+                let preds: Vec<String> = pushdown_predicates
+                    .iter()
+                    .map(|p| p.display_name())
+                    .collect();
                 write!(out, ", pushdown=[{}]", preds.join(", "))?;
             }
             if let Some(n) = limit {
@@ -513,7 +542,9 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             }
             writeln!(out)?;
         }
-        LogicalPlan::Filter { input, predicate, .. } => {
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
             writeln!(out, "{pad}Filter: {}", predicate.display_name())?;
             write_indented(input, out, depth + 1)?;
         }
@@ -522,17 +553,34 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             writeln!(out, "{pad}Projection: [{}]", names.join(", "))?;
             write_indented(input, out, depth + 1)?;
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, .. } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            ..
+        } => {
             let g: Vec<String> = group_exprs.iter().map(|e| e.display_name()).collect();
             let a: Vec<String> = agg_exprs.iter().map(|e| e.display_name()).collect();
-            writeln!(out, "{pad}Aggregate: groupBy=[{}] aggs=[{}]", g.join(", "), a.join(", "))?;
+            writeln!(
+                out,
+                "{pad}Aggregate: groupBy=[{}] aggs=[{}]",
+                g.join(", "),
+                a.join(", ")
+            )?;
             write_indented(input, out, depth + 1)?;
         }
         LogicalPlan::Limit { input, n, .. } => {
             writeln!(out, "{pad}Limit: {n}")?;
             write_indented(input, out, depth + 1)?;
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            ..
+        } => {
             let on_str: Vec<String> = on
                 .iter()
                 .map(|(l, r)| format!("{} = {}", l.display_name(), r.display_name()))
@@ -540,7 +588,12 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             if on_str.is_empty() {
                 writeln!(out, "{pad}{}Join", join_type.name())?;
             } else {
-                writeln!(out, "{pad}{}Join: on=[{}]", join_type.name(), on_str.join(", "))?;
+                writeln!(
+                    out,
+                    "{pad}{}Join: on=[{}]",
+                    join_type.name(),
+                    on_str.join(", ")
+                )?;
             }
             if let Some(f) = filter {
                 let inner_pad = "  ".repeat(depth + 1);

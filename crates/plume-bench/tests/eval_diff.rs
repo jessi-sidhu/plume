@@ -49,8 +49,22 @@ fn ints_with_nulls() -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5), Some(-3)])),
-            Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40), Some(5), Some(0)])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                None,
+                Some(4),
+                Some(5),
+                Some(-3),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                None,
+                Some(30),
+                Some(40),
+                Some(5),
+                Some(0),
+            ])),
         ],
     )
     .unwrap()
@@ -64,8 +78,18 @@ fn floats() -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Float64Array::from(vec![Some(1.5), Some(2.5), None, Some(4.0)])),
-            Arc::new(Float64Array::from(vec![Some(0.5), Some(2.5), Some(3.0), None])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.5),
+                Some(2.5),
+                None,
+                Some(4.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(0.5),
+                Some(2.5),
+                Some(3.0),
+                None,
+            ])),
         ],
     )
     .unwrap()
@@ -75,7 +99,9 @@ fn ids_int64() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 100, 1_000_000]))],
+        vec![Arc::new(Int64Array::from(vec![
+            1_i64, 2, 3, 100, 1_000_000,
+        ]))],
     )
     .unwrap()
 }
@@ -84,7 +110,12 @@ fn names() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob"), Some("alice")]))],
+        vec![Arc::new(StringArray::from(vec![
+            Some("alice"),
+            None,
+            Some("bob"),
+            Some("alice"),
+        ]))],
     )
     .unwrap()
 }
@@ -94,40 +125,104 @@ fn bools() -> RecordBatch {
         Field::new("x", DataType::Boolean, true),
         Field::new("y", DataType::Boolean, true),
     ]));
-    let xs = vec![Some(true), Some(true), None, Some(false), Some(false), None, None, Some(true), Some(false)];
-    let ys = vec![Some(true), Some(false), Some(true), Some(true), Some(false), Some(false), None, None, None];
+    let xs = vec![
+        Some(true),
+        Some(true),
+        None,
+        Some(false),
+        Some(false),
+        None,
+        None,
+        Some(true),
+        Some(false),
+    ];
+    let ys = vec![
+        Some(true),
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+        Some(false),
+        None,
+        None,
+        None,
+    ];
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(BooleanArray::from(xs)), Arc::new(BooleanArray::from(ys))],
+        vec![
+            Arc::new(BooleanArray::from(xs)),
+            Arc::new(BooleanArray::from(ys)),
+        ],
     )
     .unwrap()
 }
 
 // ---- comparisons --------------------------------------------------------
 
-#[test] fn eq_int_column_vs_literal()  -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").eq(lit(2_i32)),     "a = 2") }
-#[test] fn neq_int_column_vs_literal() -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").neq(lit(2_i32)),    "a <> 2") }
-#[test] fn lt_int_column_vs_literal()  -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").lt(lit(4_i32)),     "a < 4") }
-#[test] fn lt_eq_int_column_vs_literal() -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").lt_eq(lit(4_i32)), "a <= 4") }
-#[test] fn gt_int_column_vs_literal()  -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").gt(lit(2_i32)),     "a > 2") }
-#[test] fn gt_eq_int_column_vs_literal() -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").gt_eq(lit(2_i32)), "a >= 2") }
+#[test]
+fn eq_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").eq(lit(2_i32)), "a = 2")
+}
+#[test]
+fn neq_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").neq(lit(2_i32)), "a <> 2")
+}
+#[test]
+fn lt_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").lt(lit(4_i32)), "a < 4")
+}
+#[test]
+fn lt_eq_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").lt_eq(lit(4_i32)), "a <= 4")
+}
+#[test]
+fn gt_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").gt(lit(2_i32)), "a > 2")
+}
+#[test]
+fn gt_eq_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").gt_eq(lit(2_i32)), "a >= 2")
+}
 
-#[test] fn eq_float_column_vs_literal() -> Result<()> { diff_expr(&floats(), &col("p").eq(lit(2.5_f64)), "p = 2.5") }
-#[test] fn lt_float_column_vs_column()  -> Result<()> { diff_expr(&floats(), &col("p").lt(col("q")),     "p < q") }
+#[test]
+fn eq_float_column_vs_literal() -> Result<()> {
+    diff_expr(&floats(), &col("p").eq(lit(2.5_f64)), "p = 2.5")
+}
+#[test]
+fn lt_float_column_vs_column() -> Result<()> {
+    diff_expr(&floats(), &col("p").lt(col("q")), "p < q")
+}
 
-#[test] fn eq_string_column_vs_literal() -> Result<()> { diff_expr(&names(), &col("name").eq(lit("alice")), "name = 'alice'") }
-#[test] fn neq_string_column_vs_literal() -> Result<()> { diff_expr(&names(), &col("name").neq(lit("alice")), "name <> 'alice'") }
+#[test]
+fn eq_string_column_vs_literal() -> Result<()> {
+    diff_expr(&names(), &col("name").eq(lit("alice")), "name = 'alice'")
+}
+#[test]
+fn neq_string_column_vs_literal() -> Result<()> {
+    diff_expr(&names(), &col("name").neq(lit("alice")), "name <> 'alice'")
+}
 
-#[test] fn col_vs_col_eq_with_nulls() -> Result<()> {
+#[test]
+fn col_vs_col_eq_with_nulls() -> Result<()> {
     diff_expr(&ints_with_nulls(), &col("a").eq(col("b")), "a = b")
 }
 
 // ---- arithmetic --------------------------------------------------------
 
-#[test] fn add_int_column_vs_literal() -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").plus(lit(1_i32)),  "a + 1") }
-#[test] fn sub_int_column_vs_column()  -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").minus(col("b")),   "a - b") }
-#[test] fn mul_int_column_vs_literal() -> Result<()> { diff_expr(&ints_with_nulls(), &col("a").mul(lit(10_i32)),  "a * 10") }
-#[test] fn div_int_column_vs_column()  -> Result<()> {
+#[test]
+fn add_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").plus(lit(1_i32)), "a + 1")
+}
+#[test]
+fn sub_int_column_vs_column() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").minus(col("b")), "a - b")
+}
+#[test]
+fn mul_int_column_vs_literal() -> Result<()> {
+    diff_expr(&ints_with_nulls(), &col("a").mul(lit(10_i32)), "a * 10")
+}
+#[test]
+fn div_int_column_vs_column() -> Result<()> {
     // DuckDB integer division returns DOUBLE by default; cast to keep it integer
     // so plume's Int32 / Int32 -> Int32 result matches. Both still skip nulls
     // and avoid divide-by-zero (we constructed b to have a 0 in last row, so
@@ -139,19 +234,35 @@ fn bools() -> RecordBatch {
     )
 }
 
-#[test] fn mul_float() -> Result<()> { diff_expr(&floats(), &col("p").mul(lit(2.0_f64)), "p * 2.0") }
-#[test] fn div_float_col_col() -> Result<()> { diff_expr(&floats(), &col("p").div(col("q")), "p / q") }
+#[test]
+fn mul_float() -> Result<()> {
+    diff_expr(&floats(), &col("p").mul(lit(2.0_f64)), "p * 2.0")
+}
+#[test]
+fn div_float_col_col() -> Result<()> {
+    diff_expr(&floats(), &col("p").div(col("q")), "p / q")
+}
 
-#[test] fn add_int64_with_literal() -> Result<()> { diff_expr(&ids_int64(), &col("id").plus(lit(100_i64)), "id + 100") }
+#[test]
+fn add_int64_with_literal() -> Result<()> {
+    diff_expr(&ids_int64(), &col("id").plus(lit(100_i64)), "id + 100")
+}
 
 // ---- logical / Kleene --------------------------------------------------
 
-#[test] fn and_kleene_against_duckdb() -> Result<()> { diff_expr(&bools(), &col("x").and(col("y")), "x AND y") }
-#[test] fn or_kleene_against_duckdb()  -> Result<()> { diff_expr(&bools(), &col("x").or(col("y")),  "x OR y") }
+#[test]
+fn and_kleene_against_duckdb() -> Result<()> {
+    diff_expr(&bools(), &col("x").and(col("y")), "x AND y")
+}
+#[test]
+fn or_kleene_against_duckdb() -> Result<()> {
+    diff_expr(&bools(), &col("x").or(col("y")), "x OR y")
+}
 
 // ---- compound ----------------------------------------------------------
 
-#[test] fn nested_predicate_with_nulls() -> Result<()> {
+#[test]
+fn nested_predicate_with_nulls() -> Result<()> {
     diff_expr(
         &ints_with_nulls(),
         &col("a").gt(lit(1_i32)).and(col("b").lt(lit(50_i32))),
@@ -159,7 +270,8 @@ fn bools() -> RecordBatch {
     )
 }
 
-#[test] fn nested_arithmetic_then_compare() -> Result<()> {
+#[test]
+fn nested_arithmetic_then_compare() -> Result<()> {
     diff_expr(
         &ints_with_nulls(),
         &col("a").plus(col("b")).gt(lit(10_i32)),
@@ -167,7 +279,8 @@ fn bools() -> RecordBatch {
     )
 }
 
-#[test] fn alias_does_not_affect_result() -> Result<()> {
+#[test]
+fn alias_does_not_affect_result() -> Result<()> {
     diff_expr(
         &ints_with_nulls(),
         &col("a").gt(lit(2_i32)).alias("big_enough"),
@@ -175,7 +288,8 @@ fn bools() -> RecordBatch {
     )
 }
 
-#[test] fn null_in_comparison_propagates() -> Result<()> {
+#[test]
+fn null_in_comparison_propagates() -> Result<()> {
     // Specifically: rows where b IS NULL should yield NULL in `b > 0`.
     diff_expr(&ints_with_nulls(), &col("b").gt(lit(0_i32)), "b > 0")
 }

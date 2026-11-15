@@ -42,7 +42,9 @@ fn filter_predicates(plan: &LogicalPlan) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(p: &LogicalPlan, out: &mut Vec<String>) {
         match p {
-            LogicalPlan::Filter { input, predicate, .. } => {
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => {
                 out.push(predicate.display_name());
                 walk(input, out);
             }
@@ -67,8 +69,14 @@ fn inner_join_pushes_left_only_predicate_into_left_subtree() {
     // Filter on customers.name above the join: should land as a Filter
     // wrapping the customers scan.
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .filter(col("name").eq(lit("alice"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .filter(col("name").eq(lit("alice")))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
@@ -91,8 +99,14 @@ fn inner_join_pushes_left_only_predicate_into_left_subtree() {
 #[test]
 fn inner_join_pushes_right_only_predicate_into_right_subtree() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .filter(col("amount").gt(lit(500.0_f64))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .filter(col("amount").gt(lit(500.0_f64)))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
@@ -110,13 +124,26 @@ fn inner_join_splits_two_conjuncts_across_sides() {
     // `name = "alice" AND amount > 500` — each conjunct goes to its
     // own side; no Filter remains above the join.
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .filter(col("name").eq(lit("alice")).and(col("amount").gt(lit(500.0_f64)))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .filter(
+            col("name")
+                .eq(lit("alice"))
+                .and(col("amount").gt(lit(500.0_f64))),
+        )
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
     assert!(filter_predicates_above_join(&optimized).is_empty());
-    assert!(contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
+    assert!(contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
     assert!(contains_filter(right_subtree(&optimized), "(amount > 500)"));
 }
 
@@ -125,8 +152,18 @@ fn inner_join_keeps_both_side_predicate_above() {
     // `customers.id = orders.customer_id` is a both-side conjunct. It
     // should stay above the join (Phase 5 doesn't fold into Join.filter).
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .filter(col("region").eq(lit("west")).and(col("id").eq(col("customer_id")))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .filter(
+            col("region")
+                .eq(lit("west"))
+                .and(col("id").eq(col("customer_id"))),
+        )
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
@@ -134,7 +171,9 @@ fn inner_join_keeps_both_side_predicate_above() {
     // The region = "west" left-only conjunct pushed left; the both-side
     // id = customer_id stays above.
     assert!(
-        preds_above.iter().any(|p| p.contains("id") && p.contains("customer_id")),
+        preds_above
+            .iter()
+            .any(|p| p.contains("id") && p.contains("customer_id")),
         "expected both-side conjunct to stay above the Join, got: {preds_above:?}"
     );
 }
@@ -150,8 +189,14 @@ fn left_join_does_not_push_right_only_predicate() {
     // would then evaluate against a NULL `amount`, not a real one,
     // changing the answer.
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Left).unwrap()
-        .filter(col("amount").gt(lit(100.0_f64))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Left,
+        )
+        .unwrap()
+        .filter(col("amount").gt(lit(100.0_f64)))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
@@ -178,13 +223,22 @@ fn left_join_does_push_left_only_predicate() {
     // *can* push, because the left side is the preserved side and
     // shrinking it just produces fewer (still-correctly-padded) rows.
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Left).unwrap()
-        .filter(col("name").eq(lit("alice"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Left,
+        )
+        .unwrap()
+        .filter(col("name").eq(lit("alice")))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
     assert!(filter_predicates_above_join(&optimized).is_empty());
-    assert!(contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
+    assert!(contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
 }
 
 // ---- Right join: left-only mirrors Left ------------------------------
@@ -192,8 +246,14 @@ fn left_join_does_push_left_only_predicate() {
 #[test]
 fn right_join_does_not_push_left_only_predicate() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Right).unwrap()
-        .filter(col("name").eq(lit("alice"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Right,
+        )
+        .unwrap()
+        .filter(col("name").eq(lit("alice")))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
@@ -203,14 +263,23 @@ fn right_join_does_not_push_left_only_predicate() {
         "left-only predicate must stay above a RIGHT join. plan:\n{}",
         optimized.explain()
     );
-    assert!(!contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
+    assert!(!contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
 }
 
 #[test]
 fn right_join_does_push_right_only_predicate() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Right).unwrap()
-        .filter(col("amount").gt(lit(500.0_f64))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Right,
+        )
+        .unwrap()
+        .filter(col("amount").gt(lit(500.0_f64)))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
     assert!(filter_predicates_above_join(&optimized).is_empty());
@@ -222,19 +291,37 @@ fn right_join_does_push_right_only_predicate() {
 #[test]
 fn full_join_does_not_push_anything() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Full).unwrap()
-        .filter(col("name").eq(lit("alice")).and(col("amount").gt(lit(500.0_f64)))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Full,
+        )
+        .unwrap()
+        .filter(
+            col("name")
+                .eq(lit("alice"))
+                .and(col("amount").gt(lit(500.0_f64))),
+        )
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
 
     let preds_above = filter_predicates_above_join(&optimized);
     assert!(
-        preds_above.iter().any(|p| p.contains("name") && p.contains("amount")),
+        preds_above
+            .iter()
+            .any(|p| p.contains("name") && p.contains("amount")),
         "FULL join must keep all predicates above. plan:\n{}",
         optimized.explain()
     );
-    assert!(!contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
-    assert!(!contains_filter(right_subtree(&optimized), "(amount > 500)"));
+    assert!(!contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
+    assert!(!contains_filter(
+        right_subtree(&optimized),
+        "(amount > 500)"
+    ));
 }
 
 // ---- Semi/Anti: left-only predicates push -----------------------------
@@ -242,23 +329,41 @@ fn full_join_does_not_push_anything() {
 #[test]
 fn semi_join_pushes_left_only_predicate() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Semi).unwrap()
-        .filter(col("name").eq(lit("alice"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Semi,
+        )
+        .unwrap()
+        .filter(col("name").eq(lit("alice")))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
     assert!(filter_predicates_above_join(&optimized).is_empty());
-    assert!(contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
+    assert!(contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
 }
 
 #[test]
 fn anti_join_pushes_left_only_predicate() {
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Anti).unwrap()
-        .filter(col("name").eq(lit("alice"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Anti,
+        )
+        .unwrap()
+        .filter(col("name").eq(lit("alice")))
+        .unwrap()
         .into_plan();
     let optimized = pushdown_predicates(plan).unwrap();
     assert!(filter_predicates_above_join(&optimized).is_empty());
-    assert!(contains_filter(left_subtree(&optimized), "(name = \"alice\")"));
+    assert!(contains_filter(
+        left_subtree(&optimized),
+        "(name = \"alice\")"
+    ));
 }
 
 // ---- Pushdown reaches Parquet scan ------------------------------------
@@ -270,8 +375,14 @@ fn pushdown_through_join_reaches_scan_pushdown_predicates() {
     // hint on that scan (the existing scan-pushdown rule fires on
     // the wrapped Filter -> Scan subtree).
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .filter(col("region").eq(lit("west"))).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .filter(col("region").eq(lit("west")))
+        .unwrap()
         .into_plan();
     let optimized = optimize(plan).unwrap();
 
@@ -279,10 +390,19 @@ fn pushdown_through_join_reaches_scan_pushdown_predicates() {
     // (region = "west").
     let customers_scan = find_scan_by_path(&optimized, "customers.parquet")
         .expect("customers scan should still exist");
-    if let LogicalPlan::Scan { pushdown_predicates, .. } = customers_scan {
-        let names: Vec<String> = pushdown_predicates.iter().map(|p| p.display_name()).collect();
+    if let LogicalPlan::Scan {
+        pushdown_predicates,
+        ..
+    } = customers_scan
+    {
+        let names: Vec<String> = pushdown_predicates
+            .iter()
+            .map(|p| p.display_name())
+            .collect();
         assert!(
-            names.iter().any(|n| n.contains("region") && n.contains("west")),
+            names
+                .iter()
+                .any(|n| n.contains("region") && n.contains("west")),
             "expected (region = \"west\") in customers scan pushdown_predicates, got {names:?}"
         );
     } else {
@@ -298,24 +418,47 @@ fn column_pruning_narrows_each_join_side_independently() {
     // After pruning, the customers scan should keep only (id, name)
     // and the orders scan should keep only (customer_id, amount).
     let plan = customers()
-        .join(orders(), vec![(col("id"), col("customer_id"))], JoinType::Inner).unwrap()
-        .project(vec![col("name"), col("amount")]).unwrap()
+        .join(
+            orders(),
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
+        .unwrap()
+        .project(vec![col("name"), col("amount")])
+        .unwrap()
         .into_plan();
     let optimized = optimize(plan).unwrap();
 
     let cust = find_scan_by_path(&optimized, "customers.parquet").unwrap();
     let ord = find_scan_by_path(&optimized, "orders.parquet").unwrap();
-    if let LogicalPlan::Scan { projection: Some(cols), .. } = cust {
+    if let LogicalPlan::Scan {
+        projection: Some(cols),
+        ..
+    } = cust
+    {
         assert!(cols.contains(&"name".to_string()));
         assert!(cols.contains(&"id".to_string()), "join key must be kept");
-        assert!(!cols.contains(&"region".to_string()), "region not referenced");
+        assert!(
+            !cols.contains(&"region".to_string()),
+            "region not referenced"
+        );
     } else {
         panic!("customers scan was not column-pruned");
     }
-    if let LogicalPlan::Scan { projection: Some(cols), .. } = ord {
+    if let LogicalPlan::Scan {
+        projection: Some(cols),
+        ..
+    } = ord
+    {
         assert!(cols.contains(&"amount".to_string()));
-        assert!(cols.contains(&"customer_id".to_string()), "join key must be kept");
-        assert!(!cols.contains(&"id".to_string()), "orders.id not referenced");
+        assert!(
+            cols.contains(&"customer_id".to_string()),
+            "join key must be kept"
+        );
+        assert!(
+            !cols.contains(&"id".to_string()),
+            "orders.id not referenced"
+        );
     } else {
         panic!("orders scan was not column-pruned");
     }
@@ -329,7 +472,9 @@ fn filter_predicates_above_join(plan: &LogicalPlan) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(p: &LogicalPlan, out: &mut Vec<String>) {
         match p {
-            LogicalPlan::Filter { input, predicate, .. } => {
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => {
                 out.push(predicate.display_name());
                 walk(input, out);
             }
@@ -355,7 +500,9 @@ fn left_subtree(plan: &LogicalPlan) -> &LogicalPlan {
             LogicalPlan::Scan { .. } => panic!("no Join in plan"),
         }
     }
-    let LogicalPlan::Join { left, .. } = find_join(plan) else { unreachable!() };
+    let LogicalPlan::Join { left, .. } = find_join(plan) else {
+        unreachable!()
+    };
     left
 }
 
@@ -370,13 +517,17 @@ fn right_subtree(plan: &LogicalPlan) -> &LogicalPlan {
             LogicalPlan::Scan { .. } => panic!("no Join in plan"),
         }
     }
-    let LogicalPlan::Join { right, .. } = find_join(plan) else { unreachable!() };
+    let LogicalPlan::Join { right, .. } = find_join(plan) else {
+        unreachable!()
+    };
     right
 }
 
 fn contains_filter(plan: &LogicalPlan, predicate_text: &str) -> bool {
     match plan {
-        LogicalPlan::Filter { input, predicate, .. } => {
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
             if predicate.display_name() == predicate_text {
                 true
             } else {
@@ -416,7 +567,8 @@ fn find_scan_by_path<'a>(plan: &'a LogicalPlan, suffix: &str) -> Option<&'a Logi
 fn filter_predicates_helper_smoke() {
     // Smoke-check the helper itself doesn't crash on a join-free plan.
     let plan = customers()
-        .filter(col("region").eq(lit("west"))).unwrap()
+        .filter(col("region").eq(lit("west")))
+        .unwrap()
         .into_plan();
     let preds = filter_predicates(&plan);
     assert_eq!(preds, vec!["(region = \"west\")"]);

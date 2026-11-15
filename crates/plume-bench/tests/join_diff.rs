@@ -19,8 +19,12 @@ fn orders_path() -> Option<PathBuf> {
 }
 fn fixture(name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("fixtures").join(name);
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fixtures")
+        .join(name);
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
         return None;
@@ -32,8 +36,12 @@ fn fixture(name: &str) -> Option<PathBuf> {
 
 #[test]
 fn inner_join_single_key_drops_nulls_and_orphans() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -59,8 +67,12 @@ fn inner_join_single_key_drops_nulls_and_orphans() -> Result<()> {
 
 #[test]
 fn inner_join_multi_key_two_columns() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     // (id = customer_id) AND (region = region) — the second predicate
     // tightens the match: only orders whose region matches the
     // customer's region survive.
@@ -93,8 +105,12 @@ fn inner_join_then_filter_above() -> Result<()> {
     // Filter on a right-side column applied above the join. The optimizer
     // can't push it through yet (Phase 5), but the operators must handle
     // a Filter -> Join chain end-to-end.
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -120,8 +136,12 @@ fn inner_join_then_filter_above() -> Result<()> {
 
 #[test]
 fn left_join_keeps_unmatched_left_rows() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -143,8 +163,12 @@ fn left_join_keeps_unmatched_left_rows() -> Result<()> {
 
 #[test]
 fn right_join_keeps_unmatched_right_rows() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -166,8 +190,12 @@ fn right_join_keeps_unmatched_right_rows() -> Result<()> {
 
 #[test]
 fn full_join_keeps_both_unmatched_sides() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -196,8 +224,12 @@ fn left_join_then_filter_on_right_amount_strips_nulls() -> Result<()> {
     // we check here. Phase 5's pushdown rule must NOT push this
     // predicate through the join (a regression test for that rule
     // lives in optimizer/tests/, not here).
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -226,8 +258,12 @@ fn semi_join_emits_only_matched_left_rows() -> Result<()> {
     // SEMI: customers that have at least one order. No duplicate
     // customer rows even when a customer has many orders. Output is
     // exactly the customers schema.
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -253,8 +289,12 @@ fn semi_join_emits_only_matched_left_rows() -> Result<()> {
 fn anti_join_emits_unmatched_left_rows() -> Result<()> {
     // ANTI: customers with NO orders, plus customers with NULL ids
     // (NULL ≠ NULL means they never match anything).
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .join(
             scan_parquet_auto(&o)?,
@@ -278,8 +318,12 @@ fn anti_join_emits_unmatched_left_rows() -> Result<()> {
 
 #[test]
 fn cross_join_small_slices() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     // Limit both sides before crossing so the test stays fast. 5 x 5 = 25.
     let plan = scan_parquet_auto(&c)?
         .limit(5)
@@ -302,8 +346,12 @@ fn cross_join_small_slices() -> Result<()> {
 
 #[test]
 fn cross_join_with_residual_filter_above() -> Result<()> {
-    let Some(c) = customers_path() else { return Ok(()) };
-    let Some(o) = orders_path() else { return Ok(()) };
+    let Some(c) = customers_path() else {
+        return Ok(());
+    };
+    let Some(o) = orders_path() else {
+        return Ok(());
+    };
     let plan = scan_parquet_auto(&c)?
         .limit(10)
         .cross_join(scan_parquet_auto(&o)?.limit(10))?

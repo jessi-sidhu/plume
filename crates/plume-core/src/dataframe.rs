@@ -17,27 +17,39 @@ pub struct DataFrame {
 
 impl DataFrame {
     pub fn scan_csv(path: impl Into<PathBuf>, schema: SchemaRef) -> Self {
-        DataFrame { plan: LogicalPlan::scan_csv(path, schema) }
+        DataFrame {
+            plan: LogicalPlan::scan_csv(path, schema),
+        }
     }
 
     pub fn scan_parquet(path: impl Into<PathBuf>, schema: SchemaRef) -> Self {
-        DataFrame { plan: LogicalPlan::scan_parquet(path, schema) }
+        DataFrame {
+            plan: LogicalPlan::scan_parquet(path, schema),
+        }
     }
 
     pub fn filter(self, predicate: Expr) -> Result<Self> {
-        Ok(DataFrame { plan: LogicalPlan::filter(self.plan, predicate)? })
+        Ok(DataFrame {
+            plan: LogicalPlan::filter(self.plan, predicate)?,
+        })
     }
 
     pub fn project(self, exprs: Vec<Expr>) -> Result<Self> {
-        Ok(DataFrame { plan: LogicalPlan::project(self.plan, exprs)? })
+        Ok(DataFrame {
+            plan: LogicalPlan::project(self.plan, exprs)?,
+        })
     }
 
     pub fn aggregate(self, group: Vec<Expr>, aggs: Vec<Expr>) -> Result<Self> {
-        Ok(DataFrame { plan: LogicalPlan::aggregate(self.plan, group, aggs)? })
+        Ok(DataFrame {
+            plan: LogicalPlan::aggregate(self.plan, group, aggs)?,
+        })
     }
 
     pub fn limit(self, n: usize) -> Self {
-        DataFrame { plan: LogicalPlan::limit(self.plan, n) }
+        DataFrame {
+            plan: LogicalPlan::limit(self.plan, n),
+        }
     }
 
     /// Equi-join `self` with `right` on `on` (parallel `(left_expr,
@@ -57,7 +69,9 @@ impl DataFrame {
 
     /// Cross join: every row on the left paired with every row on the right.
     pub fn cross_join(self, right: DataFrame) -> Result<Self> {
-        Ok(DataFrame { plan: LogicalPlan::cross_join(self.plan, right.plan)? })
+        Ok(DataFrame {
+            plan: LogicalPlan::cross_join(self.plan, right.plan)?,
+        })
     }
 
     pub fn schema(&self) -> SchemaRef {

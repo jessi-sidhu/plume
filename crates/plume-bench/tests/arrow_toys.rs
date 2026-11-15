@@ -62,10 +62,7 @@ fn write_then_read_parquet_roundtrip() -> Result<()> {
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?.build()?;
     let read = reader.next().unwrap()?;
     assert_eq!(read.num_rows(), 3);
-    assert_eq!(
-        read.column(1).as_string::<i32>().value(2),
-        "c"
-    );
+    assert_eq!(read.column(1).as_string::<i32>().value(2), "c");
     Ok(())
 }
 

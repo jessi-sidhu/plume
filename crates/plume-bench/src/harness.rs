@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arrow_schema::Schema;
-use parquet::arrow::ArrowWriter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
@@ -21,7 +19,9 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
+use arrow_schema::Schema;
 use duckdb::Connection;
+use parquet::arrow::ArrowWriter;
 
 /// Pretty-print a value at row `i` of an Arrow array, using the marker
 /// `<NULL>` for null cells. Kept narrow on purpose — extend as new types
@@ -101,17 +101,16 @@ pub fn duckdb_query(
         .with_context(|| format!("register csv view {name}"))?;
     }
     for (name, path) in register_parquets {
-        let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 parquet path"))?;
+        let p = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 parquet path"))?;
         conn.execute_batch(&format!(
             "CREATE VIEW {name} AS SELECT * FROM read_parquet('{p}');"
         ))
         .with_context(|| format!("register parquet view {name}"))?;
     }
     let mut stmt = conn.prepare(sql).context("prepare sql")?;
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .context("execute sql")?
-        .collect();
+    let batches: Vec<RecordBatch> = stmt.query_arrow([]).context("execute sql")?.collect();
     Ok(batches)
 }
 

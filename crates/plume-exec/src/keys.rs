@@ -34,21 +34,31 @@ pub fn extract_key(arr: &ArrayRef, row: usize) -> EvalResult<KeyValue> {
     }
     Ok(match arr.data_type() {
         DataType::Boolean => KeyValue::Bool(arr.as_boolean().value(row)),
-        DataType::Int8 => {
-            KeyValue::Int(arr.as_primitive::<arrow_array::types::Int8Type>().value(row) as i64)
-        }
-        DataType::Int16 => {
-            KeyValue::Int(arr.as_primitive::<arrow_array::types::Int16Type>().value(row) as i64)
-        }
+        DataType::Int8 => KeyValue::Int(
+            arr.as_primitive::<arrow_array::types::Int8Type>()
+                .value(row) as i64,
+        ),
+        DataType::Int16 => KeyValue::Int(
+            arr.as_primitive::<arrow_array::types::Int16Type>()
+                .value(row) as i64,
+        ),
         DataType::Int32 => KeyValue::Int(arr.as_primitive::<Int32Type>().value(row) as i64),
         DataType::Int64 => KeyValue::Int(arr.as_primitive::<Int64Type>().value(row)),
         DataType::Float32 => KeyValue::Float(
-            (arr.as_primitive::<arrow_array::types::Float32Type>().value(row) as f64).to_bits(),
+            (arr.as_primitive::<arrow_array::types::Float32Type>()
+                .value(row) as f64)
+                .to_bits(),
         ),
-        DataType::Float64 => KeyValue::Float(arr.as_primitive::<Float64Type>().value(row).to_bits()),
+        DataType::Float64 => {
+            KeyValue::Float(arr.as_primitive::<Float64Type>().value(row).to_bits())
+        }
         DataType::Utf8 => KeyValue::Str(arr.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => KeyValue::Str(arr.as_string::<i64>().value(row).to_string()),
-        other => return Err(EvalError::NotImplemented(format!("hash key over {other:?}"))),
+        other => {
+            return Err(EvalError::NotImplemented(format!(
+                "hash key over {other:?}"
+            )))
+        }
     })
 }
 

@@ -54,7 +54,10 @@ impl Default for Optimizer {
 
 impl Optimizer {
     pub fn with_rules(rules: Vec<Box<dyn OptimizerRule>>) -> Self {
-        Self { rules, max_passes: 8 }
+        Self {
+            rules,
+            max_passes: 8,
+        }
     }
 
     /// Apply every rule in order; repeat until a full pass changes nothing
@@ -106,7 +109,9 @@ pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
 pub struct ColumnPruning;
 
 impl OptimizerRule for ColumnPruning {
-    fn name(&self) -> &str { "column_pruning" }
+    fn name(&self) -> &str {
+        "column_pruning"
+    }
 
     fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let required: HashSet<String> = plan
@@ -124,12 +129,30 @@ fn prune_with_required(
     required_from_above: &HashSet<String>,
 ) -> Result<LogicalPlan> {
     match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => {
+        LogicalPlan::Scan {
+            source,
+            schema,
+            projection,
+            pushdown_predicates,
+            limit,
+        } => {
             if matches!(source, ScanSource::Csv { .. }) {
-                return Ok(LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit });
+                return Ok(LogicalPlan::Scan {
+                    source,
+                    schema,
+                    projection,
+                    pushdown_predicates,
+                    limit,
+                });
             }
             if projection.is_some() {
-                return Ok(LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit });
+                return Ok(LogicalPlan::Scan {
+                    source,
+                    schema,
+                    projection,
+                    pushdown_predicates,
+                    limit,
+                });
             }
             // Predicate columns must be retained even though the predicate
             // already lives in pushdown_predicates — the per-row Filter
@@ -146,7 +169,11 @@ fn prune_with_required(
                 .collect();
             if kept.len() == schema.fields().len() {
                 return Ok(LogicalPlan::Scan {
-                    source, schema, projection: None, pushdown_predicates, limit,
+                    source,
+                    schema,
+                    projection: None,
+                    pushdown_predicates,
+                    limit,
                 });
             }
             let kept = if kept.is_empty() {
@@ -158,18 +185,31 @@ fn prune_with_required(
             let scan = LogicalPlan::with_pushdown_predicates(scan, pushdown_predicates)?;
             LogicalPlan::with_scan_limit(scan, limit)
         }
-        LogicalPlan::Filter { input, predicate, schema: _ } => {
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            schema: _,
+        } => {
             let mut needed = required_from_above.clone();
             collect_columns(&predicate, &mut needed);
             let pruned_input = prune_with_required(*input, &needed)?;
             LogicalPlan::filter(pruned_input, predicate)
         }
-        LogicalPlan::Projection { input, exprs, schema: _ } => {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema: _,
+        } => {
             let needed = exprs_columns(&exprs);
             let pruned_input = prune_with_required(*input, &needed)?;
             LogicalPlan::project(pruned_input, exprs)
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema: _ } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema: _,
+        } => {
             let mut needed = exprs_columns(&group_exprs);
             for e in &agg_exprs {
                 collect_columns(e, &mut needed);
@@ -177,11 +217,22 @@ fn prune_with_required(
             let pruned_input = prune_with_required(*input, &needed)?;
             LogicalPlan::aggregate(pruned_input, group_exprs, agg_exprs)
         }
-        LogicalPlan::Limit { input, n, schema: _ } => {
+        LogicalPlan::Limit {
+            input,
+            n,
+            schema: _,
+        } => {
             let pruned_input = prune_with_required(*input, required_from_above)?;
             Ok(LogicalPlan::limit(pruned_input, n))
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, schema: out_schema } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            schema: out_schema,
+        } => {
             // Required set splits across the join.
             //
             // For Semi/Anti the output schema is exactly the left input's,
@@ -220,8 +271,7 @@ fn prune_with_required(
                     if i < n_left {
                         left_required.insert(left_schema.field(i).name().clone());
                     } else {
-                        right_required
-                            .insert(right_schema.field(i - n_left).name().clone());
+                        right_required.insert(right_schema.field(i - n_left).name().clone());
                     }
                 }
             }
@@ -264,7 +314,9 @@ fn exprs_columns(exprs: &[Expr]) -> HashSet<String> {
 
 fn collect_columns(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        Expr::Column(name) => { out.insert(name.clone()); }
+        Expr::Column(name) => {
+            out.insert(name.clone());
+        }
         Expr::Literal(_) => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_columns(left, out);
@@ -282,7 +334,9 @@ fn collect_columns(e: &Expr, out: &mut HashSet<String>) {
 pub struct PredicatePushdown;
 
 impl OptimizerRule for PredicatePushdown {
-    fn name(&self) -> &str { "predicate_pushdown" }
+    fn name(&self) -> &str {
+        "predicate_pushdown"
+    }
 
     fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         push_through(plan)
@@ -291,7 +345,11 @@ impl OptimizerRule for PredicatePushdown {
 
 fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
     match plan {
-        LogicalPlan::Filter { input, predicate, schema: _ } => {
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            schema: _,
+        } => {
             // Filter sitting directly on a Join: split the predicate
             // into AND-conjuncts and route each safely. This is the
             // join-aware pushdown path; its safety rules are the
@@ -304,9 +362,14 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
             let pushable = collect_pushable(&predicate);
             let new_input = match (pushable.is_empty(), &pushed_input) {
                 (true, _) => pushed_input,
-                (false, LogicalPlan::Scan { source, pushdown_predicates: existing, .. })
-                    if matches!(source, ScanSource::Parquet { .. }) =>
-                {
+                (
+                    false,
+                    LogicalPlan::Scan {
+                        source,
+                        pushdown_predicates: existing,
+                        ..
+                    },
+                ) if matches!(source, ScanSource::Parquet { .. }) => {
                     // De-dupe by string form so re-running the rule is idempotent.
                     let mut all = existing.clone();
                     let existing_text: HashSet<String> =
@@ -323,19 +386,39 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::filter(new_input, predicate)
         }
         LogicalPlan::Scan { .. } => Ok(plan),
-        LogicalPlan::Projection { input, exprs, schema: _ } => {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema: _,
+        } => {
             let new_input = push_through(*input)?;
             LogicalPlan::project(new_input, exprs)
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema: _ } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema: _,
+        } => {
             let new_input = push_through(*input)?;
             LogicalPlan::aggregate(new_input, group_exprs, agg_exprs)
         }
-        LogicalPlan::Limit { input, n, schema: _ } => {
+        LogicalPlan::Limit {
+            input,
+            n,
+            schema: _,
+        } => {
             let new_input = push_through(*input)?;
             Ok(LogicalPlan::limit(new_input, n))
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            ..
+        } => {
             // Bare Join (no Filter on top): just recurse into both
             // children so further pushdowns inside each subtree run.
             let new_left = push_through(*left)?;
@@ -375,7 +458,15 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// predicate during the probe rather than after. That's a follow-up; for
 /// now both-side conjuncts stay above the join.
 fn push_filter_through_join(join: LogicalPlan, predicate: Expr) -> Result<LogicalPlan> {
-    let LogicalPlan::Join { left, right, on, filter, join_type, .. } = join else {
+    let LogicalPlan::Join {
+        left,
+        right,
+        on,
+        filter,
+        join_type,
+        ..
+    } = join
+    else {
         unreachable!("push_filter_through_join called on non-Join input")
     };
 
@@ -445,7 +536,11 @@ fn split_conjunction(expr: &Expr) -> Vec<Expr> {
     let mut out = Vec::new();
     fn walk(e: &Expr, out: &mut Vec<Expr>) {
         match e {
-            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 walk(left, out);
                 walk(right, out);
             }
@@ -481,7 +576,11 @@ fn collect_pushable(e: &Expr) -> Vec<Expr> {
 
 fn walk_conjunction(e: &Expr, out: &mut Vec<Expr>) {
     match e {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             walk_conjunction(left, out);
             walk_conjunction(right, out);
         }
@@ -495,7 +594,9 @@ fn walk_conjunction(e: &Expr, out: &mut Vec<Expr>) {
 }
 
 fn normalize_pushable(e: &Expr) -> Option<Expr> {
-    let Expr::BinaryOp { left, op, right } = e else { return None };
+    let Expr::BinaryOp { left, op, right } = e else {
+        return None;
+    };
     if !op.is_comparison() {
         return None;
     }
@@ -524,7 +625,9 @@ fn strip_alias(e: &Expr) -> &Expr {
     }
 }
 
-fn is_null(v: &ScalarValue) -> bool { matches!(v, ScalarValue::Null) }
+fn is_null(v: &ScalarValue) -> bool {
+    matches!(v, ScalarValue::Null)
+}
 
 fn flip(op: BinaryOperator) -> BinaryOperator {
     use BinaryOperator::*;
@@ -554,7 +657,9 @@ fn flip(op: BinaryOperator) -> BinaryOperator {
 pub struct ConstantFolding;
 
 impl OptimizerRule for ConstantFolding {
-    fn name(&self) -> &str { "constant_folding" }
+    fn name(&self) -> &str {
+        "constant_folding"
+    }
 
     fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         rewrite_exprs_in_plan(plan, &fold_expr)
@@ -569,18 +674,34 @@ fn fold_expr(e: Expr) -> Expr {
             // Boolean short-circuits — only safe when the literal isn't NULL.
             if op == BinaryOperator::And {
                 if let Expr::Literal(ScalarValue::Boolean(b)) = &l {
-                    return if *b { r } else { Expr::Literal(ScalarValue::Boolean(false)) };
+                    return if *b {
+                        r
+                    } else {
+                        Expr::Literal(ScalarValue::Boolean(false))
+                    };
                 }
                 if let Expr::Literal(ScalarValue::Boolean(b)) = &r {
-                    return if *b { l } else { Expr::Literal(ScalarValue::Boolean(false)) };
+                    return if *b {
+                        l
+                    } else {
+                        Expr::Literal(ScalarValue::Boolean(false))
+                    };
                 }
             }
             if op == BinaryOperator::Or {
                 if let Expr::Literal(ScalarValue::Boolean(b)) = &l {
-                    return if *b { Expr::Literal(ScalarValue::Boolean(true)) } else { r };
+                    return if *b {
+                        Expr::Literal(ScalarValue::Boolean(true))
+                    } else {
+                        r
+                    };
                 }
                 if let Expr::Literal(ScalarValue::Boolean(b)) = &r {
-                    return if *b { Expr::Literal(ScalarValue::Boolean(true)) } else { l };
+                    return if *b {
+                        Expr::Literal(ScalarValue::Boolean(true))
+                    } else {
+                        l
+                    };
                 }
             }
             // lit OP lit -> lit  (comparisons + arithmetic on matching types)
@@ -589,10 +710,20 @@ fn fold_expr(e: Expr) -> Expr {
                     return Expr::Literal(folded);
                 }
             }
-            Expr::BinaryOp { left: Box::new(l), op, right: Box::new(r) }
+            Expr::BinaryOp {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            }
         }
-        Expr::Aggregate { fun, arg } => Expr::Aggregate { fun, arg: Box::new(fold_expr(*arg)) },
-        Expr::Alias { expr, name } => Expr::Alias { expr: Box::new(fold_expr(*expr)), name },
+        Expr::Aggregate { fun, arg } => Expr::Aggregate {
+            fun,
+            arg: Box::new(fold_expr(*arg)),
+        },
+        Expr::Alias { expr, name } => Expr::Alias {
+            expr: Box::new(fold_expr(*expr)),
+            name,
+        },
         leaf => leaf,
     }
 }
@@ -637,35 +768,56 @@ fn fold_literal_binop(l: &ScalarValue, op: BinaryOperator, r: &ScalarValue) -> O
 fn rewrite_exprs_in_plan(plan: LogicalPlan, f: &impl Fn(Expr) -> Expr) -> Result<LogicalPlan> {
     Ok(match plan {
         LogicalPlan::Scan { .. } => plan,
-        LogicalPlan::Filter { input, predicate, schema: _ } => {
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            schema: _,
+        } => {
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             LogicalPlan::filter(new_input, f(predicate))?
         }
-        LogicalPlan::Projection { input, exprs, schema: _ } => {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema: _,
+        } => {
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             let new_exprs = exprs.into_iter().map(f).collect();
             LogicalPlan::project(new_input, new_exprs)?
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema: _ } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema: _,
+        } => {
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             let new_group = group_exprs.into_iter().map(f).collect();
             let new_agg = agg_exprs.into_iter().map(f).collect();
             LogicalPlan::aggregate(new_input, new_group, new_agg)?
         }
-        LogicalPlan::Limit { input, n, schema: _ } => {
+        LogicalPlan::Limit {
+            input,
+            n,
+            schema: _,
+        } => {
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             LogicalPlan::limit(new_input, n)
         }
-        LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            ..
+        } => {
             let new_left = rewrite_exprs_in_plan(*left, f)?;
             let new_right = rewrite_exprs_in_plan(*right, f)?;
             // Apply f to both halves of every key pair, plus the residual
             // filter. f is schema-preserving (it folds expression sub-trees
             // to literals), so the rebuilt Join has the same output schema.
-            let new_on: Vec<(Expr, Expr)> = on
-                .into_iter()
-                .map(|(l, r)| (f(l), f(r)))
-                .collect();
+            let new_on: Vec<(Expr, Expr)> = on.into_iter().map(|(l, r)| (f(l), f(r))).collect();
             let new_filter = filter.map(f);
             LogicalPlan::join(new_left, new_right, new_on, new_filter, join_type)?
         }
@@ -684,11 +836,17 @@ fn rewrite_exprs_in_plan(plan: LogicalPlan, f: &impl Fn(Expr) -> Expr) -> Result
 pub struct DeadProjectionElim;
 
 impl OptimizerRule for DeadProjectionElim {
-    fn name(&self) -> &str { "dead_projection_elim" }
+    fn name(&self) -> &str {
+        "dead_projection_elim"
+    }
 
     fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         match plan {
-            LogicalPlan::Projection { input, exprs, schema: _ } => {
+            LogicalPlan::Projection {
+                input,
+                exprs,
+                schema: _,
+            } => {
                 let inner = self.rewrite(*input)?;
                 if is_identity_projection(&exprs, &inner) {
                     Ok(inner)
@@ -696,17 +854,31 @@ impl OptimizerRule for DeadProjectionElim {
                     LogicalPlan::project(inner, exprs)
                 }
             }
-            LogicalPlan::Filter { input, predicate, schema: _ } => {
-                LogicalPlan::filter(self.rewrite(*input)?, predicate)
-            }
-            LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema: _ } => {
-                LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs)
-            }
-            LogicalPlan::Limit { input, n, schema: _ } => {
-                Ok(LogicalPlan::limit(self.rewrite(*input)?, n))
-            }
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                schema: _,
+            } => LogicalPlan::filter(self.rewrite(*input)?, predicate),
+            LogicalPlan::Aggregate {
+                input,
+                group_exprs,
+                agg_exprs,
+                schema: _,
+            } => LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs),
+            LogicalPlan::Limit {
+                input,
+                n,
+                schema: _,
+            } => Ok(LogicalPlan::limit(self.rewrite(*input)?, n)),
             LogicalPlan::Scan { .. } => Ok(plan),
-            LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                on,
+                filter,
+                join_type,
+                ..
+            } => {
                 let new_left = self.rewrite(*left)?;
                 let new_right = self.rewrite(*right)?;
                 LogicalPlan::join(new_left, new_right, on, filter, join_type)
@@ -743,11 +915,17 @@ fn is_identity_projection(exprs: &[Expr], input: &LogicalPlan) -> bool {
 pub struct LimitPushdown;
 
 impl OptimizerRule for LimitPushdown {
-    fn name(&self) -> &str { "limit_pushdown" }
+    fn name(&self) -> &str {
+        "limit_pushdown"
+    }
 
     fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         match plan {
-            LogicalPlan::Limit { input, n, schema: _ } => {
+            LogicalPlan::Limit {
+                input,
+                n,
+                schema: _,
+            } => {
                 let inner = self.rewrite(*input)?;
                 // The Limit operator stays in the plan to guarantee the
                 // contract — folding the limit into the Scan is just a
@@ -758,17 +936,31 @@ impl OptimizerRule for LimitPushdown {
                 };
                 Ok(LogicalPlan::limit(folded_inner, n))
             }
-            LogicalPlan::Filter { input, predicate, schema: _ } => {
-                LogicalPlan::filter(self.rewrite(*input)?, predicate)
-            }
-            LogicalPlan::Projection { input, exprs, schema: _ } => {
-                LogicalPlan::project(self.rewrite(*input)?, exprs)
-            }
-            LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema: _ } => {
-                LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs)
-            }
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                schema: _,
+            } => LogicalPlan::filter(self.rewrite(*input)?, predicate),
+            LogicalPlan::Projection {
+                input,
+                exprs,
+                schema: _,
+            } => LogicalPlan::project(self.rewrite(*input)?, exprs),
+            LogicalPlan::Aggregate {
+                input,
+                group_exprs,
+                agg_exprs,
+                schema: _,
+            } => LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs),
             LogicalPlan::Scan { .. } => Ok(plan),
-            LogicalPlan::Join { left, right, on, filter, join_type, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                on,
+                filter,
+                join_type,
+                ..
+            } => {
                 // Joins change row count, so a Limit above never folds
                 // through. Recurse into both children to allow
                 // Limit-pushdown opportunities inside each subtree.
@@ -787,31 +979,47 @@ enum FoldResult {
 
 fn try_fold_limit(plan: LogicalPlan, n: usize) -> Result<FoldResult> {
     match plan {
-        LogicalPlan::Scan { source, schema, projection, pushdown_predicates, limit } => {
+        LogicalPlan::Scan {
+            source,
+            schema,
+            projection,
+            pushdown_predicates,
+            limit,
+        } => {
             // Honour the smaller of any pre-existing scan limit and the new one.
             let merged = match limit {
                 None => Some(n),
                 Some(existing) => Some(existing.min(n)),
             };
             let scan = LogicalPlan::Scan {
-                source, schema, projection, pushdown_predicates, limit: merged,
+                source,
+                schema,
+                projection,
+                pushdown_predicates,
+                limit: merged,
             };
             Ok(FoldResult::Folded(scan))
         }
         // Projection preserves row count (one row in, one row out), so we
         // can fold past it: rebuild Projection over a folded scan.
-        LogicalPlan::Projection { input, exprs, schema: _ } => {
-            match try_fold_limit(*input, n)? {
-                FoldResult::Folded(new_inner) => {
-                    Ok(FoldResult::Folded(LogicalPlan::project(new_inner, exprs)?))
-                }
-                FoldResult::NotFolded(inner) => {
-                    Ok(FoldResult::NotFolded(LogicalPlan::project(inner, exprs)?))
-                }
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema: _,
+        } => match try_fold_limit(*input, n)? {
+            FoldResult::Folded(new_inner) => {
+                Ok(FoldResult::Folded(LogicalPlan::project(new_inner, exprs)?))
             }
-        }
+            FoldResult::NotFolded(inner) => {
+                Ok(FoldResult::NotFolded(LogicalPlan::project(inner, exprs)?))
+            }
+        },
         // Limit-on-Limit: take the tighter cap and fold through.
-        LogicalPlan::Limit { input, n: inner_n, schema: _ } => {
+        LogicalPlan::Limit {
+            input,
+            n: inner_n,
+            schema: _,
+        } => {
             let tighter = n.min(inner_n);
             match try_fold_limit(*input, tighter)? {
                 FoldResult::Folded(new_inner) => {
@@ -833,9 +1041,5 @@ fn try_fold_limit(plan: LogicalPlan, n: usize) -> Result<FoldResult> {
 
 /// Render before/after plans side by side.
 pub fn explain_optimized(before: &LogicalPlan, after: &LogicalPlan) -> String {
-    format!(
-        "BEFORE:\n{}\nAFTER:\n{}",
-        before.explain(),
-        after.explain()
-    )
+    format!("BEFORE:\n{}\nAFTER:\n{}", before.explain(), after.explain())
 }

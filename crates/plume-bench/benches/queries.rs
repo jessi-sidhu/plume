@@ -41,8 +41,12 @@ fn sales_path() -> Option<PathBuf> {
 
 fn fixture_path(name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("fixtures").join(name);
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fixtures")
+        .join(name);
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
         return None;
@@ -75,7 +79,11 @@ fn build_groupby_plan(path: &std::path::Path) -> plume_core::LogicalPlan {
         .unwrap()
         .aggregate(
             vec![col("region")],
-            vec![count_star().alias("n"), avg(col("price")).alias("avg_price"), sum(col("quantity")).alias("total_qty")],
+            vec![
+                count_star().alias("n"),
+                avg(col("price")).alias("avg_price"),
+                sum(col("quantity")).alias("total_qty"),
+            ],
         )
         .unwrap()
         .into_plan()
@@ -140,7 +148,9 @@ fn synthetic_batch(n: usize) -> RecordBatch {
 fn bench_evaluator(c: &mut Criterion) {
     // (price > 500.0) AND (region = 'west') over a synthetic 8192-row batch.
     let batch = synthetic_batch(8192);
-    let predicate: Expr = col("price").gt(lit(500.0_f64)).and(col("region").eq(lit("west")));
+    let predicate: Expr = col("price")
+        .gt(lit(500.0_f64))
+        .and(col("region").eq(lit("west")));
     let compiled = compile(&predicate, batch.schema().as_ref()).unwrap();
 
     let mut group = c.benchmark_group("expression_evaluator");
@@ -208,8 +218,12 @@ fn build_left_join_with_filter_plan(
 }
 
 fn bench_joins(c: &mut Criterion) {
-    let Some(customers) = fixture_path("customers.parquet") else { return };
-    let Some(orders) = fixture_path("orders.parquet") else { return };
+    let Some(customers) = fixture_path("customers.parquet") else {
+        return;
+    };
+    let Some(orders) = fixture_path("orders.parquet") else {
+        return;
+    };
 
     let mut group = c.benchmark_group("joins");
     group.sample_size(50);

@@ -46,7 +46,11 @@ fn harness_runs_duckdb_at_all() -> Result<()> {
 #[test]
 fn harness_matches_handbuilt_batch_against_duckdb_constant() -> Result<()> {
     // Build the same single-row result by hand and ask the harness to diff it.
-    let schema = Arc::new(Schema::new(vec![Field::new("answer", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "answer",
+        DataType::Int32,
+        false,
+    )]));
     let actual = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![42]))])?;
     assert_matches_duckdb(
         std::slice::from_ref(&actual),
@@ -59,7 +63,9 @@ fn harness_matches_handbuilt_batch_against_duckdb_constant() -> Result<()> {
 
 #[test]
 fn harness_matches_csv_count_against_duckdb() -> Result<()> {
-    let Some(csv) = require_fixture("people.csv") else { return Ok(()); };
+    let Some(csv) = require_fixture("people.csv") else {
+        return Ok(());
+    };
 
     // We don't have plume's scan operator yet, so we hand-build the expected
     // single-row result and let the harness confirm DuckDB agrees. This proves
@@ -75,10 +81,16 @@ fn harness_matches_csv_count_against_duckdb() -> Result<()> {
     )?;
 
     // Bonus sanity check: the region column has exactly the four values we put in.
-    let regions_schema = Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, false)]));
+    let regions_schema = Arc::new(Schema::new(vec![Field::new(
+        "region",
+        DataType::Utf8,
+        false,
+    )]));
     let regions_actual = RecordBatch::try_new(
         regions_schema,
-        vec![Arc::new(StringArray::from(vec!["east", "north", "south", "west"]))],
+        vec![Arc::new(StringArray::from(vec![
+            "east", "north", "south", "west",
+        ]))],
     )?;
     assert_matches_duckdb(
         std::slice::from_ref(&regions_actual),

@@ -97,15 +97,14 @@ impl ParallelParquetScanExec {
 }
 
 impl ExecutionPlan for ParallelParquetScanExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         // ---- one cheap metadata pass on the main thread to compute
         //      surviving row groups under any pushdown predicates ----------
-        let surviving = surviving_row_groups(
-            &self.path,
-            &self.pushdown_predicates,
-        )?;
+        let surviving = surviving_row_groups(&self.path, &self.pushdown_predicates)?;
 
         // Snapshot the per-worker config into owned values so the spawned
         // thread doesn't need to borrow self.
@@ -124,10 +123,7 @@ impl ExecutionPlan for ParallelParquetScanExec {
             .name("plume-par-scan-driver".into())
             .spawn(move || {
                 let pool = match max_workers {
-                    Some(n) => rayon::ThreadPoolBuilder::new()
-                        .num_threads(n)
-                        .build()
-                        .ok(),
+                    Some(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().ok(),
                     None => None,
                 };
 
@@ -216,7 +212,9 @@ fn surviving_row_groups(
     let kept: Vec<usize> = (0..total)
         .filter(|&rg_idx| {
             let rg = metadata.row_group(rg_idx);
-            predicates.iter().all(|pred| row_group_can_satisfy(pred, rg, root))
+            predicates
+                .iter()
+                .all(|pred| row_group_can_satisfy(pred, rg, root))
         })
         .collect();
     Ok(Arc::new(kept))
@@ -230,35 +228,56 @@ fn row_group_can_satisfy(
     rg: &parquet::file::metadata::RowGroupMetaData,
     parquet_root: &parquet::schema::types::Type,
 ) -> bool {
-    let Expr::BinaryOp { left, op, right } = pred else { return true };
-    let Expr::Column(name) = left.as_ref() else { return true };
-    let Expr::Literal(lit) = right.as_ref() else { return true };
-    let Some(col_idx) = parquet_root.get_fields().iter().position(|f| f.name() == name) else {
+    let Expr::BinaryOp { left, op, right } = pred else {
+        return true;
+    };
+    let Expr::Column(name) = left.as_ref() else {
+        return true;
+    };
+    let Expr::Literal(lit) = right.as_ref() else {
+        return true;
+    };
+    let Some(col_idx) = parquet_root
+        .get_fields()
+        .iter()
+        .position(|f| f.name() == name)
+    else {
         return true;
     };
     let chunk = rg.column(col_idx);
-    let Some(stats) = chunk.statistics() else { return true };
+    let Some(stats) = chunk.statistics() else {
+        return true;
+    };
     if let Some(null_count) = stats.null_count_opt() {
         if null_count == rg.num_rows() as u64 {
             return false;
         }
     }
     match (stats, lit) {
-        (Statistics::Int32(s), ScalarValue::Int32(v)) => {
-            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v as i64)
-        }
-        (Statistics::Int32(s), ScalarValue::Int64(v)) => {
-            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v)
-        }
+        (Statistics::Int32(s), ScalarValue::Int32(v)) => check_ord(
+            s.min_opt().copied().map(i64::from),
+            s.max_opt().copied().map(i64::from),
+            *op,
+            *v as i64,
+        ),
+        (Statistics::Int32(s), ScalarValue::Int64(v)) => check_ord(
+            s.min_opt().copied().map(i64::from),
+            s.max_opt().copied().map(i64::from),
+            *op,
+            *v,
+        ),
         (Statistics::Int64(s), ScalarValue::Int32(v)) => {
             check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v as i64)
         }
         (Statistics::Int64(s), ScalarValue::Int64(v)) => {
             check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
         }
-        (Statistics::Float(s), ScalarValue::Float64(v)) => {
-            check_ord_f64(s.min_opt().copied().map(f64::from), s.max_opt().copied().map(f64::from), *op, *v)
-        }
+        (Statistics::Float(s), ScalarValue::Float64(v)) => check_ord_f64(
+            s.min_opt().copied().map(f64::from),
+            s.max_opt().copied().map(f64::from),
+            *op,
+            *v,
+        ),
         (Statistics::Double(s), ScalarValue::Float64(v)) => {
             check_ord_f64(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
         }
@@ -273,7 +292,9 @@ fn row_group_can_satisfy(
 
 fn check_ord<T: Ord + Copy>(min: Option<T>, max: Option<T>, op: BinaryOperator, lit: T) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     match op {
         Eq => !(lit < mn || lit > mx),
         NotEq => true,
@@ -287,7 +308,9 @@ fn check_ord<T: Ord + Copy>(min: Option<T>, max: Option<T>, op: BinaryOperator, 
 
 fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f64) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     if mn.is_nan() || mx.is_nan() || lit.is_nan() {
         return true;
     }
@@ -304,7 +327,9 @@ fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f6
 
 fn check_ord_str(min: Option<&str>, max: Option<&str>, op: BinaryOperator, lit: &str) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     match op {
         Eq => !(lit < mn || lit > mx),
         NotEq => true,

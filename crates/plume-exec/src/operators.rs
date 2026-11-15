@@ -81,7 +81,9 @@ impl CsvScanExec {
 }
 
 impl ExecutionPlan for CsvScanExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let file = File::open(&self.path)?;
@@ -159,12 +161,14 @@ impl ParquetScanExec {
 }
 
 impl ExecutionPlan for ParquetScanExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let file = File::open(&self.path)?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_batch_size(self.batch_size);
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(self.batch_size);
         if let Some(n) = self.limit {
             builder = builder.with_limit(n);
         }
@@ -179,9 +183,9 @@ impl ExecutionPlan for ParquetScanExec {
             let surviving: Vec<usize> = (0..total)
                 .filter(|&rg_idx| {
                     let rg = metadata.row_group(rg_idx);
-                    self.pushdown_predicates.iter().all(|pred| {
-                        row_group_can_satisfy(pred, rg, root)
-                    })
+                    self.pushdown_predicates
+                        .iter()
+                        .all(|pred| row_group_can_satisfy(pred, rg, root))
                 })
                 .collect();
 
@@ -232,15 +236,27 @@ fn row_group_can_satisfy(
 ) -> bool {
     // Pull `col OP lit` out of the predicate. The optimizer normalized to
     // column-on-the-left already, so we don't have to flip operators here.
-    let Expr::BinaryOp { left, op, right } = pred else { return true };
-    let Expr::Column(name) = left.as_ref() else { return true };
-    let Expr::Literal(lit) = right.as_ref() else { return true };
+    let Expr::BinaryOp { left, op, right } = pred else {
+        return true;
+    };
+    let Expr::Column(name) = left.as_ref() else {
+        return true;
+    };
+    let Expr::Literal(lit) = right.as_ref() else {
+        return true;
+    };
 
-    let Some(col_idx) = parquet_root.get_fields().iter().position(|f| f.name() == name) else {
+    let Some(col_idx) = parquet_root
+        .get_fields()
+        .iter()
+        .position(|f| f.name() == name)
+    else {
         return true; // unknown column — can't prune
     };
     let chunk = rg.column(col_idx);
-    let Some(stats) = chunk.statistics() else { return true };
+    let Some(stats) = chunk.statistics() else {
+        return true;
+    };
 
     // Treat all-null row groups specially: any non-null comparison is false
     // for every row, so the group can be pruned.
@@ -251,21 +267,30 @@ fn row_group_can_satisfy(
     }
 
     match (stats, lit) {
-        (Statistics::Int32(s), ScalarValue::Int32(v)) => {
-            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v as i64)
-        }
-        (Statistics::Int32(s), ScalarValue::Int64(v)) => {
-            check_ord(s.min_opt().copied().map(i64::from), s.max_opt().copied().map(i64::from), *op, *v)
-        }
+        (Statistics::Int32(s), ScalarValue::Int32(v)) => check_ord(
+            s.min_opt().copied().map(i64::from),
+            s.max_opt().copied().map(i64::from),
+            *op,
+            *v as i64,
+        ),
+        (Statistics::Int32(s), ScalarValue::Int64(v)) => check_ord(
+            s.min_opt().copied().map(i64::from),
+            s.max_opt().copied().map(i64::from),
+            *op,
+            *v,
+        ),
         (Statistics::Int64(s), ScalarValue::Int32(v)) => {
             check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v as i64)
         }
         (Statistics::Int64(s), ScalarValue::Int64(v)) => {
             check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
         }
-        (Statistics::Float(s), ScalarValue::Float64(v)) => {
-            check_ord_f64(s.min_opt().copied().map(f64::from), s.max_opt().copied().map(f64::from), *op, *v)
-        }
+        (Statistics::Float(s), ScalarValue::Float64(v)) => check_ord_f64(
+            s.min_opt().copied().map(f64::from),
+            s.max_opt().copied().map(f64::from),
+            *op,
+            *v,
+        ),
         (Statistics::Double(s), ScalarValue::Float64(v)) => {
             check_ord_f64(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
         }
@@ -282,14 +307,11 @@ fn row_group_can_satisfy(
 
 /// Generic ordered-type pruning check. Returns false only when proving the
 /// predicate `col OP lit` cannot be true for any value in [min, max].
-fn check_ord<T: Ord + Copy>(
-    min: Option<T>,
-    max: Option<T>,
-    op: BinaryOperator,
-    lit: T,
-) -> bool {
+fn check_ord<T: Ord + Copy>(min: Option<T>, max: Option<T>, op: BinaryOperator, lit: T) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     match op {
         Eq => !(lit < mn || lit > mx),
         // We can't exclude NotEq in general unless min == max == lit and
@@ -307,7 +329,9 @@ fn check_ord<T: Ord + Copy>(
 /// unreliable so we don't prune.
 fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f64) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     if mn.is_nan() || mx.is_nan() || lit.is_nan() {
         return true;
     }
@@ -324,7 +348,9 @@ fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f6
 
 fn check_ord_str(min: Option<&str>, max: Option<&str>, op: BinaryOperator, lit: &str) -> bool {
     use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else { return true };
+    let (Some(mn), Some(mx)) = (min, max) else {
+        return true;
+    };
     match op {
         Eq => !(lit < mn || lit > mx),
         NotEq => true,
@@ -350,7 +376,9 @@ impl MemoryExec {
 }
 
 impl ExecutionPlan for MemoryExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         // Hand back owned clones (RecordBatch is cheap to clone — Arc'd arrays).
@@ -378,15 +406,22 @@ impl FilterExec {
         // logical plan layer (LogicalPlan::filter validates the predicate
         // resolves cleanly against the input schema). If somehow a bad
         // predicate slipped through, surface it loudly at construction.
-        let compiled = compile(&predicate, schema.as_ref())
-            .expect("predicate failed to compile against input schema; \
-                    LogicalPlan::filter should have caught this at plan time");
-        Self { input, compiled, schema }
+        let compiled = compile(&predicate, schema.as_ref()).expect(
+            "predicate failed to compile against input schema; \
+                    LogicalPlan::filter should have caught this at plan time",
+        );
+        Self {
+            input,
+            compiled,
+            schema,
+        }
     }
 }
 
 impl ExecutionPlan for FilterExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let stream = self.input.execute()?;
@@ -415,14 +450,22 @@ impl ProjectionExec {
             .iter()
             .map(|e| compile(e, in_schema.as_ref()))
             .collect::<EvalResult<Vec<_>>>()
-            .expect("projection expressions failed to compile against input schema; \
-                    LogicalPlan::project should have caught this at plan time");
-        Self { input, compiled, schema }
+            .expect(
+                "projection expressions failed to compile against input schema; \
+                    LogicalPlan::project should have caught this at plan time",
+            );
+        Self {
+            input,
+            compiled,
+            schema,
+        }
     }
 }
 
 impl ExecutionPlan for ProjectionExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let stream = self.input.execute()?;
@@ -482,9 +525,14 @@ impl Iterator for LimitIter {
 }
 
 impl ExecutionPlan for LimitExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
-        Ok(Box::new(LimitIter { inner: self.input.execute()?, remaining: self.n }))
+        Ok(Box::new(LimitIter {
+            inner: self.input.execute()?,
+            remaining: self.n,
+        }))
     }
 }

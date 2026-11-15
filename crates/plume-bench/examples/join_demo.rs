@@ -28,17 +28,19 @@ use plume_optimizer::{explain_optimized, Optimizer};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("fixtures").join(name)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fixtures")
+        .join(name)
 }
 
 fn main() -> Result<()> {
     let customers_path = fixture("customers.parquet");
     let orders_path = fixture("orders.parquet");
     if !customers_path.exists() || !orders_path.exists() {
-        eprintln!(
-            "fixtures missing — run: cargo run -p plume-bench --bin gen_fixtures"
-        );
+        eprintln!("fixtures missing — run: cargo run -p plume-bench --bin gen_fixtures");
         std::process::exit(1);
     }
 

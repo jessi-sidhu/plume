@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::{cast, concat};
 use arrow::compute::kernels::aggregate;
+use arrow::compute::{cast, concat};
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
@@ -64,8 +64,12 @@ pub fn create_accumulator(
         AggregateFunction::Count => Box::new(CountAccumulator::new(arg)),
         AggregateFunction::Sum => Box::new(SumAccumulator::new(arg, input_schema)?),
         AggregateFunction::Avg => Box::new(AvgAccumulator::new(arg, input_schema)?),
-        AggregateFunction::Min => Box::new(MinMaxAccumulator::new(arg, input_schema, MinOrMax::Min)?),
-        AggregateFunction::Max => Box::new(MinMaxAccumulator::new(arg, input_schema, MinOrMax::Max)?),
+        AggregateFunction::Min => {
+            Box::new(MinMaxAccumulator::new(arg, input_schema, MinOrMax::Min)?)
+        }
+        AggregateFunction::Max => {
+            Box::new(MinMaxAccumulator::new(arg, input_schema, MinOrMax::Max)?)
+        }
     })
 }
 
@@ -90,7 +94,9 @@ pub struct CountStarAccumulator {
 }
 
 impl Accumulator for CountStarAccumulator {
-    fn data_type(&self) -> DataType { DataType::Int64 }
+    fn data_type(&self) -> DataType {
+        DataType::Int64
+    }
     fn update_batch(&mut self, batch: &RecordBatch) -> EvalResult<()> {
         self.count += batch.num_rows() as i64;
         Ok(())
@@ -110,11 +116,15 @@ pub struct CountAccumulator {
 }
 
 impl CountAccumulator {
-    pub fn new(arg: Expr) -> Self { Self { arg, count: 0 } }
+    pub fn new(arg: Expr) -> Self {
+        Self { arg, count: 0 }
+    }
 }
 
 impl Accumulator for CountAccumulator {
-    fn data_type(&self) -> DataType { DataType::Int64 }
+    fn data_type(&self) -> DataType {
+        DataType::Int64
+    }
     fn update_batch(&mut self, batch: &RecordBatch) -> EvalResult<()> {
         let arr = evaluate(&self.arg, batch)?;
         self.count += (arr.len() - arr.null_count()) as i64;
@@ -143,8 +153,11 @@ impl SumAccumulator {
         let inner_dt = arg.data_type(input_schema).map_err(plume_err)?;
         let target_dt = sum_target_type(&inner_dt)?;
         Ok(Self {
-            arg, target_dt,
-            sum_i64: 0, sum_u64: 0, sum_f64: 0.0,
+            arg,
+            target_dt,
+            sum_i64: 0,
+            sum_u64: 0,
+            sum_f64: 0.0,
             seen_non_null: false,
         })
     }
@@ -153,14 +166,18 @@ impl SumAccumulator {
 fn sum_target_type(inner: &DataType) -> EvalResult<DataType> {
     Ok(match inner {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => DataType::UInt64,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            DataType::UInt64
+        }
         DataType::Float32 | DataType::Float64 => DataType::Float64,
         other => return Err(EvalError::NotImplemented(format!("SUM over {other:?}"))),
     })
 }
 
 impl Accumulator for SumAccumulator {
-    fn data_type(&self) -> DataType { self.target_dt.clone() }
+    fn data_type(&self) -> DataType {
+        self.target_dt.clone()
+    }
 
     fn update_batch(&mut self, batch: &RecordBatch) -> EvalResult<()> {
         let arr = evaluate(&self.arg, batch)?;
@@ -218,12 +235,18 @@ impl AvgAccumulator {
         if !is_numeric(&dt) {
             return Err(EvalError::NotImplemented(format!("AVG over {dt:?}")));
         }
-        Ok(Self { arg, sum: 0.0, count: 0 })
+        Ok(Self {
+            arg,
+            sum: 0.0,
+            count: 0,
+        })
     }
 }
 
 impl Accumulator for AvgAccumulator {
-    fn data_type(&self) -> DataType { DataType::Float64 }
+    fn data_type(&self) -> DataType {
+        DataType::Float64
+    }
 
     fn update_batch(&mut self, batch: &RecordBatch) -> EvalResult<()> {
         let arr = evaluate(&self.arg, batch)?;
@@ -240,7 +263,9 @@ impl Accumulator for AvgAccumulator {
         if self.count == 0 {
             return Ok(new_null_array(&DataType::Float64, 1));
         }
-        Ok(Arc::new(Float64Array::from(vec![self.sum / self.count as f64])))
+        Ok(Arc::new(Float64Array::from(vec![
+            self.sum / self.count as f64,
+        ])))
     }
 }
 
@@ -249,7 +274,10 @@ impl Accumulator for AvgAccumulator {
 // ------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum MinOrMax { Min, Max }
+enum MinOrMax {
+    Min,
+    Max,
+}
 
 pub struct MinMaxAccumulator {
     arg: Expr,
@@ -267,19 +295,30 @@ impl MinMaxAccumulator {
         let target_dt = arg.data_type(input_schema).map_err(plume_err)?;
         // Reject types we don't support yet rather than silently misbehaving.
         match &target_dt {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-            | DataType::Float32 | DataType::Float64
-            | DataType::Utf8 | DataType::LargeUtf8 => {}
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8 => {}
             other => {
-                return Err(EvalError::NotImplemented(format!(
-                    "MIN/MAX over {other:?}"
-                )));
+                return Err(EvalError::NotImplemented(format!("MIN/MAX over {other:?}")));
             }
         }
         Ok(Self {
-            arg, target_dt, direction,
-            val_i64: None, val_u64: None, val_f64: None, val_str: None,
+            arg,
+            target_dt,
+            direction,
+            val_i64: None,
+            val_u64: None,
+            val_f64: None,
+            val_str: None,
         })
     }
 
@@ -307,8 +346,28 @@ impl MinMaxAccumulator {
         self.val_f64 = Some(match self.val_f64 {
             None => candidate,
             Some(cur) => match self.direction {
-                MinOrMax::Min => if candidate.partial_cmp(&cur).map(|o| o.is_lt()).unwrap_or(false) { candidate } else { cur },
-                MinOrMax::Max => if candidate.partial_cmp(&cur).map(|o| o.is_gt()).unwrap_or(false) { candidate } else { cur },
+                MinOrMax::Min => {
+                    if candidate
+                        .partial_cmp(&cur)
+                        .map(|o| o.is_lt())
+                        .unwrap_or(false)
+                    {
+                        candidate
+                    } else {
+                        cur
+                    }
+                }
+                MinOrMax::Max => {
+                    if candidate
+                        .partial_cmp(&cur)
+                        .map(|o| o.is_gt())
+                        .unwrap_or(false)
+                    {
+                        candidate
+                    } else {
+                        cur
+                    }
+                }
             },
         });
     }
@@ -316,15 +375,29 @@ impl MinMaxAccumulator {
         self.val_str = Some(match self.val_str.take() {
             None => candidate.to_string(),
             Some(cur) => match self.direction {
-                MinOrMax::Min => if candidate < cur.as_str() { candidate.to_string() } else { cur },
-                MinOrMax::Max => if candidate > cur.as_str() { candidate.to_string() } else { cur },
+                MinOrMax::Min => {
+                    if candidate < cur.as_str() {
+                        candidate.to_string()
+                    } else {
+                        cur
+                    }
+                }
+                MinOrMax::Max => {
+                    if candidate > cur.as_str() {
+                        candidate.to_string()
+                    } else {
+                        cur
+                    }
+                }
             },
         });
     }
 }
 
 impl Accumulator for MinMaxAccumulator {
-    fn data_type(&self) -> DataType { self.target_dt.clone() }
+    fn data_type(&self) -> DataType {
+        self.target_dt.clone()
+    }
 
     fn update_batch(&mut self, batch: &RecordBatch) -> EvalResult<()> {
         let arr = evaluate(&self.arg, batch)?;
@@ -426,9 +499,16 @@ impl Accumulator for MinMaxAccumulator {
 fn is_numeric(t: &DataType) -> bool {
     matches!(
         t,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-            | DataType::Float32 | DataType::Float64
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
     )
 }
 
@@ -449,17 +529,19 @@ pub struct AggregateExec {
 }
 
 impl AggregateExec {
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        agg_exprs: Vec<Expr>,
-        schema: SchemaRef,
-    ) -> Self {
-        Self { input, agg_exprs, schema }
+    pub fn new(input: Arc<dyn ExecutionPlan>, agg_exprs: Vec<Expr>, schema: SchemaRef) -> Self {
+        Self {
+            input,
+            agg_exprs,
+            schema,
+        }
     }
 }
 
 impl ExecutionPlan for AggregateExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let input_schema = self.input.schema();
@@ -507,7 +589,11 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
                 match v {
                     KeyValue::Null => b.append_null(),
                     KeyValue::Bool(x) => b.append_value(*x),
-                    other => return Err(EvalError::NotImplemented(format!("group key {other:?} into Boolean"))),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Boolean"
+                        )))
+                    }
                 }
             }
             Arc::new(b.finish())
@@ -518,7 +604,11 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
                 match v {
                     KeyValue::Null => b.append_null(),
                     KeyValue::Int(x) => b.append_value(*x as i32),
-                    other => return Err(EvalError::NotImplemented(format!("group key {other:?} into Int32"))),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Int32"
+                        )))
+                    }
                 }
             }
             Arc::new(b.finish())
@@ -529,7 +619,11 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
                 match v {
                     KeyValue::Null => b.append_null(),
                     KeyValue::Int(x) => b.append_value(*x),
-                    other => return Err(EvalError::NotImplemented(format!("group key {other:?} into Int64"))),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Int64"
+                        )))
+                    }
                 }
             }
             Arc::new(b.finish())
@@ -540,7 +634,11 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
                 match v {
                     KeyValue::Null => b.append_null(),
                     KeyValue::Float(bits) => b.append_value(f64::from_bits(*bits)),
-                    other => return Err(EvalError::NotImplemented(format!("group key {other:?} into Float64"))),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Float64"
+                        )))
+                    }
                 }
             }
             Arc::new(b.finish())
@@ -551,12 +649,20 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
                 match v {
                     KeyValue::Null => b.append_null(),
                     KeyValue::Str(s) => b.append_value(s),
-                    other => return Err(EvalError::NotImplemented(format!("group key {other:?} into Utf8"))),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Utf8"
+                        )))
+                    }
                 }
             }
             Arc::new(b.finish())
         }
-        other => return Err(EvalError::NotImplemented(format!("group output column type {other:?}"))),
+        other => {
+            return Err(EvalError::NotImplemented(format!(
+                "group output column type {other:?}"
+            )))
+        }
     })
 }
 
@@ -574,12 +680,19 @@ impl HashAggregateExec {
         agg_exprs: Vec<Expr>,
         schema: SchemaRef,
     ) -> Self {
-        Self { input, group_exprs, agg_exprs, schema }
+        Self {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema,
+        }
     }
 }
 
 impl ExecutionPlan for HashAggregateExec {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
     fn execute(&self) -> EvalResult<BatchStream> {
         let input_schema = self.input.schema();
@@ -638,8 +751,7 @@ impl ExecutionPlan for HashAggregateExec {
         let group_cols: Vec<ArrayRef> = (0..n_groups)
             .map(|col| {
                 let dt = self.schema.field(col).data_type();
-                let values: Vec<KeyValue> =
-                    keys_per_group.iter().map(|k| k[col].clone()).collect();
+                let values: Vec<KeyValue> = keys_per_group.iter().map(|k| k[col].clone()).collect();
                 build_group_column(dt, &values)
             })
             .collect::<EvalResult<_>>()?;
