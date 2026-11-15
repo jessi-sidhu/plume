@@ -8,6 +8,7 @@
 //! stats, type mismatches, NULL literal, exotic types) it returns true
 //! so the row group is read and the per-row Filter handles correctness.
 
+use parquet::basic::{ConvertedType, LogicalType, TimeUnit};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::Type;
@@ -55,6 +56,7 @@ pub(crate) fn row_group_can_satisfy(
     else {
         return true; // unknown column — can't prune
     };
+    let field = &parquet_root.get_fields()[col_idx];
     let chunk = rg.column(col_idx);
     let Some(stats) = chunk.statistics() else {
         return true;
@@ -102,8 +104,35 @@ pub(crate) fn row_group_can_satisfy(
             let mx = s.max_opt().and_then(|b| std::str::from_utf8(b.data()).ok());
             check_ord_str(mn, mx, *op, v.as_str())
         }
+        // DATE is stored as physical INT32 (days since epoch) and
+        // TIMESTAMP(MICROS) as physical INT64 (micros since epoch), so the
+        // stats are plain integers. Only compare them once the column's
+        // logical type confirms they mean the same thing as the literal;
+        // otherwise (e.g. an INT32 that isn't a DATE, or MILLIS/NANOS
+        // timestamps) don't prune.
+        (Statistics::Int32(s), ScalarValue::Date32(v)) if is_date(field) => {
+            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
+        }
+        (Statistics::Int64(s), ScalarValue::TimestampMicros(v)) if is_timestamp_micros(field) => {
+            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
+        }
         // Type mismatch / unsupported combo: assume the row group could match.
         _ => true,
+    }
+}
+
+fn is_date(field: &Type) -> bool {
+    let info = field.get_basic_info();
+    matches!(info.logical_type(), Some(LogicalType::Date))
+        || info.converted_type() == ConvertedType::DATE
+}
+
+fn is_timestamp_micros(field: &Type) -> bool {
+    let info = field.get_basic_info();
+    match info.logical_type() {
+        Some(LogicalType::Timestamp { unit, .. }) => matches!(unit, TimeUnit::MICROS(_)),
+        Some(_) => false,
+        None => info.converted_type() == ConvertedType::TIMESTAMP_MICROS,
     }
 }
 

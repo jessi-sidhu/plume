@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
 use crate::{PlumeError, Result};
 
@@ -22,6 +23,11 @@ pub enum ScalarValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
+    /// Days since 1970-01-01 (Arrow `Date32`, Parquet `DATE`).
+    Date32(i32),
+    /// Microseconds since 1970-01-01 00:00:00, no timezone (Arrow
+    /// `Timestamp(Microsecond, None)`, Parquet `TIMESTAMP(MICROS)`).
+    TimestampMicros(i64),
 }
 
 impl ScalarValue {
@@ -35,6 +41,8 @@ impl ScalarValue {
             ScalarValue::Int64(_) => DataType::Int64,
             ScalarValue::Float64(_) => DataType::Float64,
             ScalarValue::Utf8(_) => DataType::Utf8,
+            ScalarValue::Date32(_) => DataType::Date32,
+            ScalarValue::TimestampMicros(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
         }
     }
 
@@ -48,8 +56,55 @@ impl ScalarValue {
             ScalarValue::Int64(v) => v.to_string(),
             ScalarValue::Float64(v) => v.to_string(),
             ScalarValue::Utf8(s) => format!("\"{s}\""),
+            ScalarValue::Date32(d) => match date32_to_naive(*d) {
+                Some(date) => format!("DATE '{}'", date.format("%Y-%m-%d")),
+                None => format!("DATE({d})"),
+            },
+            ScalarValue::TimestampMicros(us) => match DateTime::from_timestamp_micros(*us) {
+                Some(ts) => format!(
+                    "TIMESTAMP '{}'",
+                    ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.f")
+                ),
+                None => format!("TIMESTAMP({us})"),
+            },
         }
     }
+
+    /// Parse `YYYY-MM-DD` into a `Date32`.
+    pub fn date32_from_str(s: &str) -> Result<ScalarValue> {
+        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|e| PlumeError::Type(format!("invalid date literal `{s}`: {e}")))?;
+        let days = date.signed_duration_since(unix_epoch_date()).num_days();
+        let days = i32::try_from(days)
+            .map_err(|_| PlumeError::Type(format!("date literal `{s}` out of Date32 range")))?;
+        Ok(ScalarValue::Date32(days))
+    }
+
+    /// Parse `YYYY-MM-DD HH:MM:SS[.ffffff]` (or with a `T` separator, or a
+    /// bare `YYYY-MM-DD` meaning midnight) into a timezone-less
+    /// `TimestampMicros`.
+    pub fn timestamp_micros_from_str(s: &str) -> Result<ScalarValue> {
+        let parsed = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+            .iter()
+            .find_map(|fmt| NaiveDateTime::parse_from_str(s, fmt).ok())
+            .or_else(|| {
+                NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+            })
+            .ok_or_else(|| PlumeError::Type(format!("invalid timestamp literal `{s}`")))?;
+        Ok(ScalarValue::TimestampMicros(
+            parsed.and_utc().timestamp_micros(),
+        ))
+    }
+}
+
+fn unix_epoch_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch")
+}
+
+fn date32_to_naive(days: i32) -> Option<NaiveDate> {
+    unix_epoch_date().checked_add_signed(chrono::Duration::days(days.into()))
 }
 
 impl From<bool> for ScalarValue {
@@ -315,6 +370,18 @@ pub fn col(name: impl Into<String>) -> Expr {
 }
 pub fn lit(v: impl Into<ScalarValue>) -> Expr {
     Expr::Literal(v.into())
+}
+/// `DATE` literal from `YYYY-MM-DD`. Panics on a malformed string, like a
+/// typo in a SQL literal; use `ScalarValue::date32_from_str` to handle the
+/// error instead.
+pub fn lit_date(s: &str) -> Expr {
+    Expr::Literal(ScalarValue::date32_from_str(s).unwrap_or_else(|e| panic!("{e}")))
+}
+/// `TIMESTAMP` literal (microseconds, no timezone) from
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]`. Panics on a malformed string; use
+/// `ScalarValue::timestamp_micros_from_str` to handle the error instead.
+pub fn lit_timestamp(s: &str) -> Expr {
+    Expr::Literal(ScalarValue::timestamp_micros_from_str(s).unwrap_or_else(|e| panic!("{e}")))
 }
 pub fn count(arg: Expr) -> Expr {
     Expr::Aggregate {
