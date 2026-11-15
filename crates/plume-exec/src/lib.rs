@@ -15,6 +15,7 @@ pub mod keys;
 pub mod operators;
 pub mod parallel;
 pub mod planner;
+mod pruning;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};

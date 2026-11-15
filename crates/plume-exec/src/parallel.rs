@@ -38,12 +38,12 @@ use std::thread;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::statistics::Statistics;
-use plume_core::{BinaryOperator, Expr, ScalarValue};
+use plume_core::Expr;
 use rayon::prelude::*;
 
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::pruning;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -193,150 +193,18 @@ fn read_row_group(
 }
 
 /// Compute the row groups that survive `predicates` against the file's
-/// metadata. Identical logic to ParquetScanExec's row_group_can_satisfy
-/// but lifted out so we can reuse it; if neither predicates nor stats are
-/// in play, returns 0..N.
+/// metadata, using the shared rule in `crate::pruning`. With no
+/// predicates, returns 0..N.
 fn surviving_row_groups(
     path: &std::path::Path,
     predicates: &[Expr],
 ) -> EvalResult<Arc<Vec<usize>>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let metadata = builder.metadata();
-    let total = metadata.num_row_groups();
-    if predicates.is_empty() {
-        return Ok(Arc::new((0..total).collect()));
-    }
-    let parquet_schema = builder.parquet_schema();
-    let root = parquet_schema.root_schema();
-    let kept: Vec<usize> = (0..total)
-        .filter(|&rg_idx| {
-            let rg = metadata.row_group(rg_idx);
-            predicates
-                .iter()
-                .all(|pred| row_group_can_satisfy(pred, rg, root))
-        })
-        .collect();
-    Ok(Arc::new(kept))
-}
-
-// Mirror of operators.rs::row_group_can_satisfy. Lifted here rather than
-// pub(crate)'d to keep operators.rs internals private; the duplication is
-// minor (a few dozen lines) and the rule is exactly identical.
-fn row_group_can_satisfy(
-    pred: &Expr,
-    rg: &parquet::file::metadata::RowGroupMetaData,
-    parquet_root: &parquet::schema::types::Type,
-) -> bool {
-    let Expr::BinaryOp { left, op, right } = pred else {
-        return true;
-    };
-    let Expr::Column(name) = left.as_ref() else {
-        return true;
-    };
-    let Expr::Literal(lit) = right.as_ref() else {
-        return true;
-    };
-    let Some(col_idx) = parquet_root
-        .get_fields()
-        .iter()
-        .position(|f| f.name() == name)
-    else {
-        return true;
-    };
-    let chunk = rg.column(col_idx);
-    let Some(stats) = chunk.statistics() else {
-        return true;
-    };
-    if let Some(null_count) = stats.null_count_opt() {
-        if null_count == rg.num_rows() as u64 {
-            return false;
-        }
-    }
-    match (stats, lit) {
-        (Statistics::Int32(s), ScalarValue::Int32(v)) => check_ord(
-            s.min_opt().copied().map(i64::from),
-            s.max_opt().copied().map(i64::from),
-            *op,
-            *v as i64,
-        ),
-        (Statistics::Int32(s), ScalarValue::Int64(v)) => check_ord(
-            s.min_opt().copied().map(i64::from),
-            s.max_opt().copied().map(i64::from),
-            *op,
-            *v,
-        ),
-        (Statistics::Int64(s), ScalarValue::Int32(v)) => {
-            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v as i64)
-        }
-        (Statistics::Int64(s), ScalarValue::Int64(v)) => {
-            check_ord(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
-        }
-        (Statistics::Float(s), ScalarValue::Float64(v)) => check_ord_f64(
-            s.min_opt().copied().map(f64::from),
-            s.max_opt().copied().map(f64::from),
-            *op,
-            *v,
-        ),
-        (Statistics::Double(s), ScalarValue::Float64(v)) => {
-            check_ord_f64(s.min_opt().copied(), s.max_opt().copied(), *op, *v)
-        }
-        (Statistics::ByteArray(s), ScalarValue::Utf8(v)) => {
-            let mn = s.min_opt().and_then(|b| std::str::from_utf8(b.data()).ok());
-            let mx = s.max_opt().and_then(|b| std::str::from_utf8(b.data()).ok());
-            check_ord_str(mn, mx, *op, v.as_str())
-        }
-        _ => true,
-    }
-}
-
-fn check_ord<T: Ord + Copy>(min: Option<T>, max: Option<T>, op: BinaryOperator, lit: T) -> bool {
-    use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else {
-        return true;
-    };
-    match op {
-        Eq => !(lit < mn || lit > mx),
-        NotEq => true,
-        Lt => mn < lit,
-        LtEq => mn <= lit,
-        Gt => mx > lit,
-        GtEq => mx >= lit,
-        _ => true,
-    }
-}
-
-fn check_ord_f64(min: Option<f64>, max: Option<f64>, op: BinaryOperator, lit: f64) -> bool {
-    use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else {
-        return true;
-    };
-    if mn.is_nan() || mx.is_nan() || lit.is_nan() {
-        return true;
-    }
-    match op {
-        Eq => !(lit < mn || lit > mx),
-        NotEq => true,
-        Lt => mn < lit,
-        LtEq => mn <= lit,
-        Gt => mx > lit,
-        GtEq => mx >= lit,
-        _ => true,
-    }
-}
-
-fn check_ord_str(min: Option<&str>, max: Option<&str>, op: BinaryOperator, lit: &str) -> bool {
-    use BinaryOperator::*;
-    let (Some(mn), Some(mx)) = (min, max) else {
-        return true;
-    };
-    match op {
-        Eq => !(lit < mn || lit > mx),
-        NotEq => true,
-        Lt => mn < lit,
-        LtEq => mn <= lit,
-        Gt => mx > lit,
-        GtEq => mx >= lit,
-        _ => true,
-    }
+    let root = builder.parquet_schema().root_schema();
+    Ok(Arc::new(pruning::surviving_row_groups(
+        builder.metadata(),
+        root,
+        predicates,
+    )))
 }
