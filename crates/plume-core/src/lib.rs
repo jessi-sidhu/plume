@@ -24,7 +24,7 @@ pub type Result<T> = std::result::Result<T, PlumeError>;
 // Re-export the surface most callers want.
 pub use dataframe::DataFrame;
 pub use expr::{
-    avg, col, count, count_star, lit, max, min, sum, AggregateFunction, BinaryOperator, Expr,
-    ScalarValue,
+    avg, col, count, count_star, lit, lit_date, lit_timestamp, max, min, sum, AggregateFunction,
+    BinaryOperator, Expr, ScalarValue,
 };
 pub use plan::{JoinType, LogicalPlan, ScanSource};

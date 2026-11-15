@@ -10,3 +10,4 @@ publish.workspace = true
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }

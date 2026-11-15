@@ -39,7 +39,11 @@ fn batch(
 }
 
 /// Run a group-by plan over in-memory batches and pull the single output batch.
-fn run(batches: Vec<RecordBatch>, group_by: Vec<plume_core::Expr>, aggs: Vec<plume_core::Expr>) -> RecordBatch {
+fn run(
+    batches: Vec<RecordBatch>,
+    group_by: Vec<plume_core::Expr>,
+    aggs: Vec<plume_core::Expr>,
+) -> RecordBatch {
     let mem: Arc<dyn ExecutionPlan> = Arc::new(MemoryExec::new(batches, schema()));
     // Build the LogicalPlan via DataFrame for schema math, then lift the
     // HashAggregateExec manually so we can substitute MemoryExec as the source.
@@ -48,13 +52,19 @@ fn run(batches: Vec<RecordBatch>, group_by: Vec<plume_core::Expr>, aggs: Vec<plu
         .unwrap();
     let plan = df.into_plan();
     let (group_exprs, agg_exprs, out_schema) = match plan {
-        plume_core::LogicalPlan::Aggregate { group_exprs, agg_exprs, schema, .. } => {
-            (group_exprs, agg_exprs, schema)
-        }
+        plume_core::LogicalPlan::Aggregate {
+            group_exprs,
+            agg_exprs,
+            schema,
+            ..
+        } => (group_exprs, agg_exprs, schema),
         _ => unreachable!(),
     };
     let exec: Arc<dyn ExecutionPlan> = Arc::new(plume_exec::HashAggregateExec::new(
-        mem, group_exprs, agg_exprs, out_schema,
+        mem,
+        group_exprs,
+        agg_exprs,
+        out_schema,
     ));
     exec.execute().unwrap().next().unwrap().unwrap()
 }
@@ -80,8 +90,14 @@ fn single_string_group_with_count_star() {
     let out = run(vec![b], vec![col("region")], vec![count_star().alias("n")]);
     assert_eq!(out.num_rows(), 2);
     let idx = name_index(&out, 0);
-    assert_eq!(out.column(1).as_primitive::<Int64Type>().value(idx["west"]), 3);
-    assert_eq!(out.column(1).as_primitive::<Int64Type>().value(idx["east"]), 2);
+    assert_eq!(
+        out.column(1).as_primitive::<Int64Type>().value(idx["west"]),
+        3
+    );
+    assert_eq!(
+        out.column(1).as_primitive::<Int64Type>().value(idx["east"]),
+        2
+    );
 }
 
 #[test]
@@ -104,7 +120,10 @@ fn group_by_two_strings_emits_one_row_per_combination() {
     let totals = out.column(2).as_primitive::<Int64Type>();
     let mut seen: HashMap<(String, String), i64> = HashMap::new();
     for i in 0..out.num_rows() {
-        seen.insert((r.value(i).to_string(), c.value(i).to_string()), totals.value(i));
+        seen.insert(
+            (r.value(i).to_string(), c.value(i).to_string()),
+            totals.value(i),
+        );
     }
     assert_eq!(seen[&("west".into(), "a".into())], 6);
     assert_eq!(seen[&("east".into(), "a".into())], 2);
@@ -116,18 +135,31 @@ fn group_by_two_strings_emits_one_row_per_combination() {
 fn group_by_aggregates_split_across_batches_and_merge() {
     // Two batches with overlapping groups — accumulator state must persist
     // between batches.
-    let b1 = batch(vec!["w", "e"], vec!["x", "x"], vec![Some(10), Some(20)], vec![Some(1.0), Some(2.0)]);
-    let b2 = batch(vec!["w", "w"], vec!["x", "x"], vec![Some(30), Some(40)], vec![Some(3.0), Some(4.0)]);
+    let b1 = batch(
+        vec!["w", "e"],
+        vec!["x", "x"],
+        vec![Some(10), Some(20)],
+        vec![Some(1.0), Some(2.0)],
+    );
+    let b2 = batch(
+        vec!["w", "w"],
+        vec!["x", "x"],
+        vec![Some(30), Some(40)],
+        vec![Some(3.0), Some(4.0)],
+    );
     let out = run(
         vec![b1, b2],
         vec![col("region")],
-        vec![sum(col("amount")).alias("total"), avg(col("price")).alias("avg_price")],
+        vec![
+            sum(col("amount")).alias("total"),
+            avg(col("price")).alias("avg_price"),
+        ],
     );
     assert_eq!(out.num_rows(), 2);
     let idx = name_index(&out, 0);
     let totals = out.column(1).as_primitive::<Int64Type>();
     let avgs = out.column(2).as_primitive::<Float64Type>();
-    assert_eq!(totals.value(idx["w"]), 80);   // 10+30+40
+    assert_eq!(totals.value(idx["w"]), 80); // 10+30+40
     assert_eq!(totals.value(idx["e"]), 20);
     assert!((avgs.value(idx["w"]) - (1.0 + 3.0 + 4.0) / 3.0).abs() < 1e-12);
     assert!((avgs.value(idx["e"]) - 2.0).abs() < 1e-12);
@@ -156,7 +188,7 @@ fn nulls_in_grouped_aggregates_skip_per_sql_semantics() {
     let total = out.column(2).as_primitive::<Int64Type>();
     let avg_arr = out.column(3).as_primitive::<Float64Type>();
     assert_eq!(n.value(idx["w"]), 2);
-    assert_eq!(total.value(idx["w"]), 10);          // null skipped
+    assert_eq!(total.value(idx["w"]), 10); // null skipped
     assert!((avg_arr.value(idx["w"]) - 10.0).abs() < 1e-12);
     assert_eq!(n.value(idx["e"]), 2);
     assert_eq!(total.value(idx["e"]), 30);
@@ -173,20 +205,35 @@ fn null_group_key_forms_its_own_bucket() {
     let b = RecordBatch::try_new(
         s.clone(),
         vec![
-            Arc::new(StringArray::from(vec![Some("a"), None, Some("a"), None, Some("b")])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("a"),
+                None,
+                Some("b"),
+            ])),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
         ],
     )
     .unwrap();
     let mem: Arc<dyn ExecutionPlan> = Arc::new(MemoryExec::new(vec![b], s.clone()));
     let df = DataFrame::scan_csv("ignored", s)
-        .aggregate(vec![col("category")], vec![sum(col("amount")).alias("total")])
+        .aggregate(
+            vec![col("category")],
+            vec![sum(col("amount")).alias("total")],
+        )
         .unwrap();
     let (g, a, out_s) = match df.into_plan() {
-        plume_core::LogicalPlan::Aggregate { group_exprs, agg_exprs, schema, .. } => (group_exprs, agg_exprs, schema),
+        plume_core::LogicalPlan::Aggregate {
+            group_exprs,
+            agg_exprs,
+            schema,
+            ..
+        } => (group_exprs, agg_exprs, schema),
         _ => unreachable!(),
     };
-    let exec: Arc<dyn ExecutionPlan> = Arc::new(plume_exec::HashAggregateExec::new(mem, g, a, out_s));
+    let exec: Arc<dyn ExecutionPlan> =
+        Arc::new(plume_exec::HashAggregateExec::new(mem, g, a, out_s));
     let out = exec.execute().unwrap().next().unwrap().unwrap();
 
     // Three groups: 'a' (1+3=4), 'b' (5), NULL (2+4=6)
@@ -195,7 +242,11 @@ fn null_group_key_forms_its_own_bucket() {
     let total = out.column(1).as_primitive::<Int64Type>();
     let mut by_key: HashMap<Option<String>, i64> = HashMap::new();
     for i in 0..out.num_rows() {
-        let k = if cat.is_null(i) { None } else { Some(cat.value(i).to_string()) };
+        let k = if cat.is_null(i) {
+            None
+        } else {
+            Some(cat.value(i).to_string())
+        };
         by_key.insert(k, total.value(i));
     }
     assert_eq!(by_key[&Some("a".into())], 4);
@@ -225,10 +276,16 @@ fn group_by_int_column_works() {
         )
         .unwrap();
     let (g, a, out_s) = match df.into_plan() {
-        plume_core::LogicalPlan::Aggregate { group_exprs, agg_exprs, schema, .. } => (group_exprs, agg_exprs, schema),
+        plume_core::LogicalPlan::Aggregate {
+            group_exprs,
+            agg_exprs,
+            schema,
+            ..
+        } => (group_exprs, agg_exprs, schema),
         _ => unreachable!(),
     };
-    let exec: Arc<dyn ExecutionPlan> = Arc::new(plume_exec::HashAggregateExec::new(mem, g, a, out_s));
+    let exec: Arc<dyn ExecutionPlan> =
+        Arc::new(plume_exec::HashAggregateExec::new(mem, g, a, out_s));
     let out = exec.execute().unwrap().next().unwrap().unwrap();
     assert_eq!(out.num_rows(), 3);
     let buckets = out.column(0).as_primitive::<Int32Type>();

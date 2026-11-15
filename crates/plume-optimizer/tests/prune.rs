@@ -47,8 +47,10 @@ fn filter_then_projection_keeps_filter_columns() {
     // Filter references `region`; projection emits `category, price`.
     // The scan must read all three.
     let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
-        .filter(col("region").eq(lit("west"))).unwrap()
-        .project(vec![col("category"), col("price")]).unwrap()
+        .filter(col("region").eq(lit("west")))
+        .unwrap()
+        .project(vec![col("category"), col("price")])
+        .unwrap()
         .into_plan();
     let pruned = prune_columns(plan).unwrap();
     let proj = scan_projection(&pruned).expect("scan must be projected");
@@ -61,7 +63,10 @@ fn aggregate_collects_group_and_agg_arg_columns() {
     let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
         .aggregate(
             vec![col("region")],
-            vec![avg(col("price")).alias("avg_price"), sum(col("quantity")).alias("total_qty")],
+            vec![
+                avg(col("price")).alias("avg_price"),
+                sum(col("quantity")).alias("total_qty"),
+            ],
         )
         .unwrap()
         .into_plan();
@@ -89,7 +94,11 @@ fn pruning_is_a_noop_when_every_column_is_required() {
     // projection as None (signal: nothing to prune).
     let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
         .project(vec![
-            col("order_id"), col("category"), col("region"), col("price"), col("quantity"),
+            col("order_id"),
+            col("category"),
+            col("region"),
+            col("price"),
+            col("quantity"),
         ])
         .unwrap()
         .into_plan();
@@ -106,8 +115,10 @@ fn csv_scans_are_intentionally_not_pruned() {
         .unwrap()
         .into_plan();
     let pruned = prune_columns(plan).unwrap();
-    assert!(scan_projection(&pruned).is_none(),
-        "CSV scans must not be pruned (W8 design choice)");
+    assert!(
+        scan_projection(&pruned).is_none(),
+        "CSV scans must not be pruned (W8 design choice)"
+    );
 }
 
 #[test]
@@ -115,9 +126,11 @@ fn limit_is_transparent_to_pruning() {
     // Projection on top is what triggers pruning. Limit must not widen
     // the required-column set passing through it.
     let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
-        .filter(col("price").gt(lit(100.0_f64))).unwrap()
+        .filter(col("price").gt(lit(100.0_f64)))
+        .unwrap()
         .limit(10)
-        .project(vec![col("category")]).unwrap()
+        .project(vec![col("category")])
+        .unwrap()
         .into_plan();
     let pruned = prune_columns(plan).unwrap();
     let proj = scan_projection(&pruned).expect("scan must be projected");
@@ -130,7 +143,8 @@ fn limit_is_transparent_to_pruning() {
 #[test]
 fn nested_aggregate_after_filter_keeps_filter_and_agg_cols() {
     let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
-        .filter(col("region").eq(lit("east"))).unwrap()
+        .filter(col("region").eq(lit("east")))
+        .unwrap()
         .aggregate(
             vec![col("category")],
             vec![sum(col("quantity")).alias("total_qty")],
@@ -149,12 +163,18 @@ fn nested_aggregate_after_filter_keeps_filter_and_agg_cols() {
 #[test]
 fn explain_shows_projection_when_optimizer_runs() {
     let plan = DataFrame::scan_parquet("s.parquet", sales_schema())
-        .aggregate(vec![col("region")], vec![avg(col("price")).alias("avg_price")])
+        .aggregate(
+            vec![col("region")],
+            vec![avg(col("price")).alias("avg_price")],
+        )
         .unwrap()
         .into_plan();
     let pruned = prune_columns(plan).unwrap();
     let s = pruned.explain();
-    assert!(s.contains("projection=["), "explain should show projection list:\n{s}");
+    assert!(
+        s.contains("projection=["),
+        "explain should show projection list:\n{s}"
+    );
     assert!(s.contains("region"));
     assert!(s.contains("price"));
 }

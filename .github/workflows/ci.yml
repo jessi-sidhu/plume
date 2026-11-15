@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The C++ sources bundled with duckdb 1.2.2 (thrift) use uint32_t without
+  # including <cstdint>, which GCC 13+ on ubuntu-latest rejects. Force the
+  # include for C++ builds; no effect on Rust code.
+  CXXFLAGS: -include cstdint
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned so a new stable release can't introduce clippy lints that
+      # break CI without any code change. Bump deliberately.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      # The bundled DuckDB build (C++) dominates a cold build; cache it.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Fixtures are gitignored; tests read them from ./fixtures.
+      - name: Generate fixtures
+        run: cargo run -p plume-bench --bin gen_fixtures
+
+      - name: Test
+        run: cargo test --workspace

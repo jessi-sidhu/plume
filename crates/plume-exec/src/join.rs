@@ -130,8 +130,7 @@ impl ExecutionPlan for HashJoinExec {
         // ---- BUILD ----------------------------------------------------
         // Drain the right side into one contiguous build table so we can
         // address build rows by a single u32 index in `take`.
-        let right_batches: Vec<RecordBatch> =
-            self.right.execute()?.collect::<EvalResult<_>>()?;
+        let right_batches: Vec<RecordBatch> = self.right.execute()?.collect::<EvalResult<_>>()?;
         let right_schema = self.right.schema();
         let build_table = if right_batches.is_empty() {
             // Even with no rows, an empty RecordBatch carrying the schema
@@ -283,12 +282,8 @@ impl ExecutionPlan for HashJoinExec {
                 left_unmatched_buf.clear();
             }
             if output_only_left && !left_only_buf.is_empty() {
-                let batch = build_left_only_batch(
-                    &schema,
-                    &left_batch,
-                    &left_only_buf,
-                    n_left_cols,
-                )?;
+                let batch =
+                    build_left_only_batch(&schema, &left_batch, &left_only_buf, n_left_cols)?;
                 if batch.num_rows() > 0 {
                     out_batches.push(batch);
                 }
@@ -354,8 +349,7 @@ impl ExecutionPlan for CrossJoinExec {
     }
 
     fn execute(&self) -> EvalResult<BatchStream> {
-        let right_batches: Vec<RecordBatch> =
-            self.right.execute()?.collect::<EvalResult<_>>()?;
+        let right_batches: Vec<RecordBatch> = self.right.execute()?.collect::<EvalResult<_>>()?;
         let right_schema = self.right.schema();
         let build_table = if right_batches.is_empty() {
             RecordBatch::new_empty(right_schema.clone())
@@ -447,7 +441,11 @@ fn build_join_batch(
         cols.push(take(left_batch.column(col).as_ref(), &left_indices, None)?);
     }
     for col in 0..build_table.num_columns() {
-        cols.push(take(build_table.column(col).as_ref(), &right_indices, None)?);
+        cols.push(take(
+            build_table.column(col).as_ref(),
+            &right_indices,
+            None,
+        )?);
     }
 
     let batch = RecordBatch::try_new(output_schema.clone(), cols)?;
@@ -534,7 +532,11 @@ fn build_right_unmatched_batch(
         ));
     }
     for col in 0..build_table.num_columns() {
-        cols.push(take(build_table.column(col).as_ref(), &right_indices, None)?);
+        cols.push(take(
+            build_table.column(col).as_ref(),
+            &right_indices,
+            None,
+        )?);
     }
     Ok(RecordBatch::try_new(output_schema.clone(), cols)?)
 }

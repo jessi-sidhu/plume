@@ -18,7 +18,8 @@ use std::sync::Arc;
 use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::DataType;
 use plume_core::{BinaryOperator, Expr, ScalarValue};
@@ -85,6 +86,8 @@ fn scalar_to_array(v: &ScalarValue, n: usize) -> EvalResult<ArrayRef> {
         ScalarValue::Int64(v) => Arc::new(Int64Array::from(vec![*v; n])),
         ScalarValue::Float64(v) => Arc::new(Float64Array::from(vec![*v; n])),
         ScalarValue::Utf8(s) => Arc::new(StringArray::from(vec![s.as_str(); n])),
+        ScalarValue::Date32(d) => Arc::new(Date32Array::from(vec![*d; n])),
+        ScalarValue::TimestampMicros(us) => Arc::new(TimestampMicrosecondArray::from(vec![*us; n])),
     })
 }
 

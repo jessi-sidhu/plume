@@ -24,7 +24,10 @@ fn write_fixture(path: &std::path::Path, rows: usize) {
     let prices: Vec<f64> = (0..rows).map(|i| i as f64 * 0.5).collect();
     let batch = RecordBatch::try_new(
         schema(),
-        vec![Arc::new(Int64Array::from(ids)), Arc::new(Float64Array::from(prices))],
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Float64Array::from(prices)),
+        ],
     )
     .unwrap();
     w.write(&batch).unwrap();
@@ -67,7 +70,10 @@ fn parquet_scan_handles_multi_row_group_file() {
         let prices: Vec<f64> = (0..50).map(|_| 1.0).collect();
         let batch = RecordBatch::try_new(
             schema(),
-            vec![Arc::new(Int64Array::from(ids)), Arc::new(Float64Array::from(prices))],
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Float64Array::from(prices)),
+            ],
         )
         .unwrap();
         w.write(&batch).unwrap();
@@ -76,10 +82,6 @@ fn parquet_scan_handles_multi_row_group_file() {
     w.close().unwrap();
 
     let exec: Arc<dyn ExecutionPlan> = Arc::new(ParquetScanExec::new(path, schema()));
-    let total: usize = exec
-        .execute()
-        .unwrap()
-        .map(|r| r.unwrap().num_rows())
-        .sum();
+    let total: usize = exec.execute().unwrap().map(|r| r.unwrap().num_rows()).sum();
     assert_eq!(total, 200);
 }

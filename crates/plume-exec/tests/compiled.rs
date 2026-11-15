@@ -17,7 +17,13 @@ fn batch() -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                None,
+                Some(4),
+                Some(5),
+            ])),
             Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5, 4.5, 5.5])),
         ],
     )

@@ -22,8 +22,10 @@ fn sales_schema() -> Arc<Schema> {
 #[test]
 fn explain_renders_chain_top_down() {
     let df = DataFrame::scan_parquet("sales.parquet", sales_schema())
-        .filter(col("region").eq(lit("west"))).unwrap()
-        .project(vec![col("category"), col("price")]).unwrap()
+        .filter(col("region").eq(lit("west")))
+        .unwrap()
+        .project(vec![col("category"), col("price")])
+        .unwrap()
         .limit(10);
 
     let s = df.explain();
@@ -52,7 +54,8 @@ fn projection_rewrites_schema_in_order() {
 fn filter_preserves_input_schema() {
     let in_schema = sales_schema();
     let df = DataFrame::scan_parquet("p.parquet", in_schema.clone())
-        .filter(col("price").gt(lit(100.0_f64))).unwrap();
+        .filter(col("price").gt(lit(100.0_f64)))
+        .unwrap();
     assert_eq!(df.schema().fields(), in_schema.fields());
 }
 
@@ -61,13 +64,26 @@ fn aggregate_emits_group_then_agg_fields() {
     let df = DataFrame::scan_parquet("p.parquet", sales_schema())
         .aggregate(
             vec![col("region"), col("category")],
-            vec![avg(col("price")).alias("avg_price"), count_star(), sum(col("quantity"))],
+            vec![
+                avg(col("price")).alias("avg_price"),
+                count_star(),
+                sum(col("quantity")),
+            ],
         )
         .unwrap();
 
     let schema = df.schema();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, vec!["region", "category", "avg_price", "count_star()", "sum(quantity)"]);
+    assert_eq!(
+        names,
+        vec![
+            "region",
+            "category",
+            "avg_price",
+            "count_star()",
+            "sum(quantity)"
+        ]
+    );
 
     // Numeric promotion rules: SUM(Int32) -> Int64, AVG(any numeric) -> Float64,
     // COUNT(*) -> Int64.
@@ -85,15 +101,19 @@ fn missing_column_is_a_schema_error() {
     let err = DataFrame::scan_parquet("p.parquet", sales_schema())
         .filter(col("nope").eq(lit(1_i32)))
         .unwrap_err();
-    matches!(err, PlumeError::Schema(_)).then_some(()).expect("expected schema error");
+    matches!(err, PlumeError::Schema(_))
+        .then_some(())
+        .expect("expected schema error");
 }
 
 #[test]
 fn non_boolean_filter_predicate_is_a_type_error() {
     let err = DataFrame::scan_parquet("p.parquet", sales_schema())
-        .filter(col("price"))   // Float64, not Boolean
+        .filter(col("price")) // Float64, not Boolean
         .unwrap_err();
-    matches!(err, PlumeError::Type(_)).then_some(()).expect("expected type error");
+    matches!(err, PlumeError::Type(_))
+        .then_some(())
+        .expect("expected type error");
 }
 
 #[test]
@@ -101,15 +121,19 @@ fn comparison_with_mismatched_types_is_a_type_error() {
     let err = DataFrame::scan_parquet("p.parquet", sales_schema())
         .filter(col("price").eq(lit("not a float")))
         .unwrap_err();
-    matches!(err, PlumeError::Type(_)).then_some(()).expect("expected type error");
+    matches!(err, PlumeError::Type(_))
+        .then_some(())
+        .expect("expected type error");
 }
 
 #[test]
 fn aggregate_rejects_non_aggregate_expr_in_agg_position() {
     let err = DataFrame::scan_parquet("p.parquet", sales_schema())
-        .aggregate(vec![col("region")], vec![col("price")])  // col, not an agg
+        .aggregate(vec![col("region")], vec![col("price")]) // col, not an agg
         .unwrap_err();
-    matches!(err, PlumeError::Plan(_)).then_some(()).expect("expected plan error");
+    matches!(err, PlumeError::Plan(_))
+        .then_some(())
+        .expect("expected plan error");
 }
 
 #[test]
@@ -142,7 +166,9 @@ fn binary_op_resolves_to_boolean() {
     let e = col("region").eq(lit("west"));
     assert_eq!(e.data_type(&s).unwrap(), DataType::Boolean);
 
-    let chained = col("price").gt(lit(10.0_f64)).and(col("region").eq(lit("east")));
+    let chained = col("price")
+        .gt(lit(10.0_f64))
+        .and(col("region").eq(lit("east")));
     assert_eq!(chained.data_type(&s).unwrap(), DataType::Boolean);
 }
 
@@ -166,7 +192,7 @@ fn customers_schema() -> Arc<Schema> {
 
 fn orders_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),         // collides with customers.id
+        Field::new("id", DataType::Int64, false), // collides with customers.id
         Field::new("customer_id", DataType::Int64, false),
         Field::new("amount", DataType::Float64, false),
     ]))
@@ -216,7 +242,11 @@ fn right_join_widens_left_side_nullability() {
     let left = DataFrame::scan_parquet("customers.parquet", customers_schema());
     let right = DataFrame::scan_parquet("orders.parquet", orders_schema());
     let joined = left
-        .join(right, vec![(col("id"), col("customer_id"))], JoinType::Right)
+        .join(
+            right,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Right,
+        )
         .unwrap();
 
     let schema = joined.schema();
@@ -284,7 +314,9 @@ fn equi_key_type_mismatch_is_a_type_error() {
     let err = left
         .join(right, vec![(col("name"), col("amount"))], JoinType::Inner)
         .unwrap_err();
-    matches!(err, PlumeError::Type(_)).then_some(()).expect("expected type error");
+    matches!(err, PlumeError::Type(_))
+        .then_some(())
+        .expect("expected type error");
 }
 
 #[test]
@@ -292,7 +324,9 @@ fn inner_join_with_no_keys_is_a_plan_error() {
     let left = DataFrame::scan_parquet("customers.parquet", customers_schema());
     let right = DataFrame::scan_parquet("orders.parquet", orders_schema());
     let err = left.join(right, vec![], JoinType::Inner).unwrap_err();
-    matches!(err, PlumeError::Plan(_)).then_some(()).expect("expected plan error");
+    matches!(err, PlumeError::Plan(_))
+        .then_some(())
+        .expect("expected plan error");
 }
 
 #[test]
@@ -300,9 +334,15 @@ fn cross_join_with_keys_is_a_plan_error() {
     let left = DataFrame::scan_parquet("customers.parquet", customers_schema());
     let right = DataFrame::scan_parquet("orders.parquet", orders_schema());
     let err = left
-        .join(right, vec![(col("id"), col("customer_id"))], JoinType::Cross)
+        .join(
+            right,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Cross,
+        )
         .unwrap_err();
-    matches!(err, PlumeError::Plan(_)).then_some(()).expect("expected plan error");
+    matches!(err, PlumeError::Plan(_))
+        .then_some(())
+        .expect("expected plan error");
 }
 
 #[test]
@@ -310,9 +350,15 @@ fn unknown_left_key_column_is_a_schema_error() {
     let left = DataFrame::scan_parquet("customers.parquet", customers_schema());
     let right = DataFrame::scan_parquet("orders.parquet", orders_schema());
     let err = left
-        .join(right, vec![(col("nope"), col("customer_id"))], JoinType::Inner)
+        .join(
+            right,
+            vec![(col("nope"), col("customer_id"))],
+            JoinType::Inner,
+        )
         .unwrap_err();
-    matches!(err, PlumeError::Schema(_)).then_some(()).expect("expected schema error");
+    matches!(err, PlumeError::Schema(_))
+        .then_some(())
+        .expect("expected schema error");
 }
 
 #[test]
@@ -322,7 +368,9 @@ fn unknown_right_key_column_is_a_schema_error() {
     let err = left
         .join(right, vec![(col("id"), col("nope"))], JoinType::Inner)
         .unwrap_err();
-    matches!(err, PlumeError::Schema(_)).then_some(()).expect("expected schema error");
+    matches!(err, PlumeError::Schema(_))
+        .then_some(())
+        .expect("expected schema error");
 }
 
 #[test]
@@ -330,7 +378,11 @@ fn join_explain_renders_two_arm_subtree() {
     let left = DataFrame::scan_parquet("customers.parquet", customers_schema());
     let right = DataFrame::scan_parquet("orders.parquet", orders_schema());
     let joined = left
-        .join(right, vec![(col("id"), col("customer_id"))], JoinType::Inner)
+        .join(
+            right,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
         .unwrap();
 
     let s = joined.explain();
@@ -374,7 +426,11 @@ fn three_way_join_via_chained_builder() {
 
     // First join on customers.id = orders.customer_id.
     let two = customers
-        .join(orders, vec![(col("id"), col("customer_id"))], JoinType::Inner)
+        .join(
+            orders,
+            vec![(col("id"), col("customer_id"))],
+            JoinType::Inner,
+        )
         .unwrap();
     // Now join the result on (concatenated) id_1 against products.product_id.
     let three = two
@@ -386,5 +442,16 @@ fn three_way_join_via_chained_builder() {
         .unwrap();
     let schema = three.schema();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, vec!["id", "name", "id_1", "customer_id", "amount", "product_id", "price"]);
+    assert_eq!(
+        names,
+        vec![
+            "id",
+            "name",
+            "id_1",
+            "customer_id",
+            "amount",
+            "product_id",
+            "price"
+        ]
+    );
 }

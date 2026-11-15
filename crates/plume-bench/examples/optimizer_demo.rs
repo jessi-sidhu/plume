@@ -35,7 +35,11 @@ fn main() -> Result<()> {
     let plan = DataFrame::scan_parquet("fixtures/sales.parquet", sales_schema())
         // Identity projection — DeadProjectionElim should drop it.
         .project(vec![
-            col("order_id"), col("category"), col("region"), col("price"), col("quantity"),
+            col("order_id"),
+            col("category"),
+            col("region"),
+            col("price"),
+            col("quantity"),
         ])?
         // Filter with a foldable RHS — ConstantFolding should evaluate the
         // arithmetic at plan time so PredicatePushdown sees `price > 150`.
@@ -44,7 +48,10 @@ fn main() -> Result<()> {
         // should restrict the parquet scan to those three columns.
         .aggregate(
             vec![col("region")],
-            vec![sum(col("quantity")).alias("total_qty"), count_star().alias("n")],
+            vec![
+                sum(col("quantity")).alias("total_qty"),
+                count_star().alias("n"),
+            ],
         )?
         // A trailing Limit at the top — LimitPushdown should fold it into
         // the Scan's row cap (and keep the Limit in place as a safety net).

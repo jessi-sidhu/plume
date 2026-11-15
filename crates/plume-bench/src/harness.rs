@@ -12,16 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arrow_schema::Schema;
-use parquet::arrow::ArrowWriter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Int8Type, TimestampMicrosecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::DataType;
+use arrow_schema::Schema;
+use arrow_schema::{DataType, TimeUnit};
 use duckdb::Connection;
+use parquet::arrow::ArrowWriter;
 
 /// Pretty-print a value at row `i` of an Arrow array, using the marker
 /// `<NULL>` for null cells. Kept narrow on purpose — extend as new types
@@ -57,6 +57,22 @@ fn render_cell(array: &dyn Array, i: usize) -> Result<String> {
                 v.to_string()
             } else {
                 format!("decimal128(scale={scale},val={v})")
+            }
+        }
+        // Dates and timezone-less microsecond timestamps render as ISO
+        // strings; both engines produce the same Arrow types for them.
+        DataType::Date32 => {
+            let v = array.as_primitive::<Date32Type>().value(i);
+            match array.as_primitive::<Date32Type>().value_as_date(i) {
+                Some(d) => d.format("%Y-%m-%d").to_string(),
+                None => format!("date32({v})"),
+            }
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            let arr = array.as_primitive::<TimestampMicrosecondType>();
+            match arr.value_as_datetime(i) {
+                Some(ts) => ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+                None => format!("timestamp_us({})", arr.value(i)),
             }
         }
         other => bail!("render_cell: unsupported type {other:?}"),
@@ -101,17 +117,16 @@ pub fn duckdb_query(
         .with_context(|| format!("register csv view {name}"))?;
     }
     for (name, path) in register_parquets {
-        let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 parquet path"))?;
+        let p = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 parquet path"))?;
         conn.execute_batch(&format!(
             "CREATE VIEW {name} AS SELECT * FROM read_parquet('{p}');"
         ))
         .with_context(|| format!("register parquet view {name}"))?;
     }
     let mut stmt = conn.prepare(sql).context("prepare sql")?;
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .context("execute sql")?
-        .collect();
+    let batches: Vec<RecordBatch> = stmt.query_arrow([]).context("execute sql")?.collect();
     Ok(batches)
 }
 

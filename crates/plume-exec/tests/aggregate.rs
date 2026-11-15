@@ -23,11 +23,29 @@ fn nums_batch() -> RecordBatch {
         nums_schema(),
         vec![
             // a: Int32 nullable
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                None,
+                Some(4),
+                Some(5),
+            ])),
             // b: Float64 nullable
-            Arc::new(Float64Array::from(vec![Some(1.0), Some(2.5), Some(3.5), None, Some(8.0)])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(2.5),
+                Some(3.5),
+                None,
+                Some(8.0),
+            ])),
             // name: Utf8 nullable
-            Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None, Some("carol"), Some("dan")])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                Some("bob"),
+                None,
+                Some("carol"),
+                Some("dan"),
+            ])),
         ],
     )
     .unwrap()
@@ -41,14 +59,18 @@ fn run_agg(batch: RecordBatch, schema: SchemaRef, aggs: Vec<plume_core::Expr>) -
     // We need a scan node that returns the same schema as our MemoryExec; use
     // a CSV scan plan node (path is unused since we're substituting the input
     // execution plan manually below).
-    let df = DataFrame::scan_csv("ignored", schema).aggregate(vec![], aggs).unwrap();
+    let df = DataFrame::scan_csv("ignored", schema)
+        .aggregate(vec![], aggs)
+        .unwrap();
     let plan = df.into_plan();
 
     // Borrow planner internals: use the mem source directly. Simpler than
     // monkey-patching the planner — we lift just the AggregateExec.
     use plume_core::LogicalPlan;
     let (agg_exprs, out_schema) = match plan {
-        LogicalPlan::Aggregate { agg_exprs, schema, .. } => (agg_exprs, schema),
+        LogicalPlan::Aggregate {
+            agg_exprs, schema, ..
+        } => (agg_exprs, schema),
         _ => unreachable!(),
     };
     let agg = plume_exec::AggregateExec::new(mem, agg_exprs, out_schema);
@@ -125,7 +147,14 @@ fn aggregate_over_empty_input_returns_null_for_sum_and_zero_for_count() {
     let out = run_agg(
         empty,
         s,
-        vec![count_star(), count(col("a")), sum(col("a")), avg(col("a")), min(col("a")), max(col("a"))],
+        vec![
+            count_star(),
+            count(col("a")),
+            sum(col("a")),
+            avg(col("a")),
+            min(col("a")),
+            max(col("a")),
+        ],
     );
     // count_star, count(a) -> 0
     assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 0);
@@ -144,15 +173,25 @@ fn aggregate_over_all_null_column_returns_null_for_sum_avg_min_max() {
         s.clone(),
         vec![
             Arc::new(Int32Array::from(vec![None, None, None] as Vec<Option<i32>>)),
-            Arc::new(Float64Array::from(vec![None, None, None] as Vec<Option<f64>>)),
-            Arc::new(StringArray::from(vec![None, None, None] as Vec<Option<&str>>)),
+            Arc::new(Float64Array::from(
+                vec![None, None, None] as Vec<Option<f64>>
+            )),
+            Arc::new(StringArray::from(
+                vec![None, None, None] as Vec<Option<&str>>
+            )),
         ],
     )
     .unwrap();
     let out = run_agg(
         batch,
         s,
-        vec![count(col("a")), sum(col("a")), avg(col("a")), min(col("a")), max(col("a"))],
+        vec![
+            count(col("a")),
+            sum(col("a")),
+            avg(col("a")),
+            min(col("a")),
+            max(col("a")),
+        ],
     );
     assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 0);
     assert!(out.column(1).is_null(0));

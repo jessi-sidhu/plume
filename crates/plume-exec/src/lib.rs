@@ -12,17 +12,23 @@ pub mod eval;
 pub mod exec;
 pub mod join;
 pub mod keys;
+pub mod metrics;
 pub mod operators;
 pub mod parallel;
 pub mod planner;
+mod pruning;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
-pub use join::{CrossJoinExec, HashJoinExec};
-pub use parallel::ParallelParquetScanExec;
 pub use exec::{BatchStream, ExecutionPlan};
+pub use join::{CrossJoinExec, HashJoinExec};
+pub use metrics::{ScanMetrics, ScanMetricsSnapshot};
 pub use operators::{
     CsvScanExec, FilterExec, LimitExec, MemoryExec, ParquetScanExec, ProjectionExec,
 };
-pub use planner::{collect, create_physical_plan};
+pub use parallel::ParallelParquetScanExec;
+pub use planner::{
+    collect, collect_with_metrics, create_physical_plan, create_physical_plan_with_metrics,
+    PlanWithMetrics,
+};

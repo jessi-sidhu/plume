@@ -12,7 +12,10 @@ use plume_io::scan_parquet_auto;
 
 fn sales_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/sales.parquet");
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
@@ -51,9 +54,11 @@ fn projection_two_cols() -> Result<()> {
 fn filter_then_project() -> Result<()> {
     let Some(p) = sales_path() else { return Ok(()) };
     diff_ordered(
-        df(&p)
-            .filter(col("region").eq(lit("west")))?
-            .project(vec![col("order_id"), col("region"), col("price")])?,
+        df(&p).filter(col("region").eq(lit("west")))?.project(vec![
+            col("order_id"),
+            col("region"),
+            col("price"),
+        ])?,
         &p,
         "SELECT order_id, region, price FROM sales WHERE region = 'west'",
     )
@@ -78,13 +83,16 @@ fn filter_float_with_limit() -> Result<()> {
 fn global_aggs_match_duckdb() -> Result<()> {
     let Some(p) = sales_path() else { return Ok(()) };
     diff_ordered(
-        df(&p).aggregate(vec![], vec![
-            count_star().alias("n"),
-            sum(col("quantity")).alias("total_qty"),
-            avg(col("price")).alias("avg_price"),
-            min(col("price")).alias("min_price"),
-            max(col("price")).alias("max_price"),
-        ])?,
+        df(&p).aggregate(
+            vec![],
+            vec![
+                count_star().alias("n"),
+                sum(col("quantity")).alias("total_qty"),
+                avg(col("price")).alias("avg_price"),
+                min(col("price")).alias("min_price"),
+                max(col("price")).alias("max_price"),
+            ],
+        )?,
         &p,
         "SELECT COUNT(*) AS n, SUM(quantity) AS total_qty, AVG(price) AS avg_price, \
                 MIN(price) AS min_price, MAX(price) AS max_price FROM sales",
@@ -99,7 +107,10 @@ fn group_by_region_count_and_sum() -> Result<()> {
     diff_unordered(
         df(&p).aggregate(
             vec![col("region")],
-            vec![count_star().alias("n"), sum(col("quantity")).alias("total_qty")],
+            vec![
+                count_star().alias("n"),
+                sum(col("quantity")).alias("total_qty"),
+            ],
         )?,
         &p,
         "SELECT region, COUNT(*) AS n, SUM(quantity) AS total_qty FROM sales GROUP BY region",
@@ -110,12 +121,13 @@ fn group_by_region_count_and_sum() -> Result<()> {
 fn group_by_category_with_filter() -> Result<()> {
     let Some(p) = sales_path() else { return Ok(()) };
     diff_unordered(
-        df(&p)
-            .filter(col("price").gt(lit(500.0_f64)))?
-            .aggregate(
-                vec![col("category")],
-                vec![count_star().alias("n"), avg(col("price")).alias("avg_price")],
-            )?,
+        df(&p).filter(col("price").gt(lit(500.0_f64)))?.aggregate(
+            vec![col("category")],
+            vec![
+                count_star().alias("n"),
+                avg(col("price")).alias("avg_price"),
+            ],
+        )?,
         &p,
         "SELECT category, COUNT(*) AS n, AVG(price) AS avg_price \
          FROM sales WHERE price > 500.0 GROUP BY category",

@@ -23,9 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow_array::{
-    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -54,7 +52,9 @@ fn fixtures_dir() -> Result<PathBuf> {
 
 fn write_people_csv(path: &PathBuf) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-    let names = ["alice", "bob", "carol", "dan", "eve", "frank", "grace", "heidi"];
+    let names = [
+        "alice", "bob", "carol", "dan", "eve", "frank", "grace", "heidi",
+    ];
     let regions = ["west", "east", "north", "south"];
 
     let mut s = String::new();
@@ -152,12 +152,14 @@ const ORDERS_ROWS: usize = 500;
 
 fn write_customers_parquet(path: &PathBuf) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),     // ~5% NULL
+        Field::new("id", DataType::Int64, true), // ~5% NULL
         Field::new("name", DataType::Utf8, false),
         Field::new("region", DataType::Utf8, false),
     ]));
     let mut rng = StdRng::seed_from_u64(0xCAFE_F00D);
-    let names = ["alice", "bob", "carol", "dan", "eve", "frank", "grace", "heidi"];
+    let names = [
+        "alice", "bob", "carol", "dan", "eve", "frank", "grace", "heidi",
+    ];
     let regions = ["west", "east", "north", "south"];
 
     let mut ids: Vec<Option<i64>> = Vec::with_capacity(CUSTOMERS_ROWS);
@@ -192,7 +194,7 @@ fn write_customers_parquet(path: &PathBuf) -> Result<()> {
 
 fn write_orders_parquet(path: &PathBuf) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),    // collides with customers.id
+        Field::new("id", DataType::Int64, false), // collides with customers.id
         Field::new("customer_id", DataType::Int64, true), // ~5% NULL, ~5% orphan
         Field::new("region", DataType::Utf8, false),
         Field::new("amount", DataType::Float64, false),
@@ -245,7 +247,10 @@ fn main() -> Result<()> {
 
     println!("writing {}", people.display());
     write_people_csv(&people)?;
-    println!("writing {} ({SALES_TOTAL} rows, {SALES_ROW_GROUPS} row groups)", sales.display());
+    println!(
+        "writing {} ({SALES_TOTAL} rows, {SALES_ROW_GROUPS} row groups)",
+        sales.display()
+    );
     write_sales_parquet(&sales)?;
     println!("writing {} ({CUSTOMERS_ROWS} rows)", customers.display());
     write_customers_parquet(&customers)?;

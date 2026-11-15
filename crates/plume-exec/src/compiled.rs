@@ -25,12 +25,17 @@ use std::sync::Arc;
 use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, TimeUnit};
 use plume_core::{BinaryOperator, Expr, ScalarValue};
 
 use crate::eval::{EvalError, EvalResult};
+
+/// `DataType` for `ScalarValue::TimestampMicros`, as a static so
+/// `CompiledExpr::data_type` can hand out a reference.
+static TIMESTAMP_MICROS: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
 
 #[derive(Debug, Clone)]
 pub enum CompiledExpr {
@@ -60,6 +65,8 @@ impl CompiledExpr {
                 ScalarValue::Int64(_) => &DataType::Int64,
                 ScalarValue::Float64(_) => &DataType::Float64,
                 ScalarValue::Utf8(_) => &DataType::Utf8,
+                ScalarValue::Date32(_) => &DataType::Date32,
+                ScalarValue::TimestampMicros(_) => &TIMESTAMP_MICROS,
             },
             // BinaryOp output type is recoverable from operand types + op,
             // but operators that already cached an output schema don't need
@@ -130,6 +137,8 @@ fn scalar_to_array(v: &ScalarValue, n: usize) -> EvalResult<ArrayRef> {
         ScalarValue::Int64(v) => Arc::new(Int64Array::from(vec![*v; n])),
         ScalarValue::Float64(v) => Arc::new(Float64Array::from(vec![*v; n])),
         ScalarValue::Utf8(s) => Arc::new(StringArray::from(vec![s.as_str(); n])),
+        ScalarValue::Date32(d) => Arc::new(Date32Array::from(vec![*d; n])),
+        ScalarValue::TimestampMicros(us) => Arc::new(TimestampMicrosecondArray::from(vec![*us; n])),
     })
 }
 

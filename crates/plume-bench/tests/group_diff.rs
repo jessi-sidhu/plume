@@ -13,7 +13,10 @@ use plume_exec::collect;
 
 fn people_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/people.csv");
     if !p.exists() {
         eprintln!("SKIP: {} missing — run gen_fixtures first", p.display());
@@ -39,7 +42,9 @@ fn diff_unordered(df: DataFrame, csv: &Path, sql: &str) -> Result<()> {
 
 #[test]
 fn group_by_region_count_star() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema())
             .aggregate(vec![col("region")], vec![count_star().alias("n")])?,
@@ -50,11 +55,16 @@ fn group_by_region_count_star() -> Result<()> {
 
 #[test]
 fn group_by_name_with_count_and_avg_score() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema()).aggregate(
             vec![col("name")],
-            vec![count_star().alias("n"), avg(col("score")).alias("avg_score")],
+            vec![
+                count_star().alias("n"),
+                avg(col("score")).alias("avg_score"),
+            ],
         )?,
         &csv,
         "SELECT name, COUNT(*) AS n, AVG(score) AS avg_score FROM people GROUP BY name",
@@ -63,11 +73,16 @@ fn group_by_name_with_count_and_avg_score() -> Result<()> {
 
 #[test]
 fn group_by_two_columns_with_sum_and_avg() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema()).aggregate(
             vec![col("region"), col("name")],
-            vec![sum(col("age")).alias("total_age"), avg(col("score")).alias("avg_score")],
+            vec![
+                sum(col("age")).alias("total_age"),
+                avg(col("score")).alias("avg_score"),
+            ],
         )?,
         &csv,
         "SELECT region, name, SUM(age) AS total_age, AVG(score) AS avg_score \
@@ -77,7 +92,9 @@ fn group_by_two_columns_with_sum_and_avg() -> Result<()> {
 
 #[test]
 fn group_by_after_filter() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema())
             .filter(col("age").gt(lit(50_i32)))?
@@ -93,11 +110,16 @@ fn group_by_after_filter() -> Result<()> {
 
 #[test]
 fn group_by_min_max_strings() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema()).aggregate(
             vec![col("region")],
-            vec![min(col("name")).alias("min_name"), max(col("name")).alias("max_name")],
+            vec![
+                min(col("name")).alias("min_name"),
+                max(col("name")).alias("max_name"),
+            ],
         )?,
         &csv,
         "SELECT region, MIN(name) AS min_name, MAX(name) AS max_name FROM people GROUP BY region",
@@ -107,7 +129,9 @@ fn group_by_min_max_strings() -> Result<()> {
 #[test]
 fn group_by_nullable_column_buckets_nulls_separately() -> Result<()> {
     // age has ~5% nulls; SQL puts all NULL ages in one group.
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema())
             .aggregate(vec![col("age")], vec![count_star().alias("n")])?,
@@ -118,13 +142,15 @@ fn group_by_nullable_column_buckets_nulls_separately() -> Result<()> {
 
 #[test]
 fn group_by_with_count_expr_skipping_nulls() -> Result<()> {
-    let Some(csv) = people_path() else { return Ok(()) };
+    let Some(csv) = people_path() else {
+        return Ok(());
+    };
     diff_unordered(
         DataFrame::scan_csv(&csv, people_schema()).aggregate(
             vec![col("region")],
             vec![
                 count_star().alias("n_total"),
-                count(col("score")).alias("n_score"),  // nulls in score => smaller
+                count(col("score")).alias("n_score"), // nulls in score => smaller
                 count(col("age")).alias("n_age"),
             ],
         )?,

@@ -14,7 +14,10 @@ use plume_optimizer::Optimizer;
 
 fn main() -> Result<()> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("fixtures/sales.parquet");
     if !p.exists() {
         eprintln!(
