@@ -155,6 +155,18 @@ pub enum BinaryOperator {
 }
 
 impl BinaryOperator {
+    /// The operator with its operands swapped (`a < b` == `b > a`).
+    pub fn flip(self) -> BinaryOperator {
+        use BinaryOperator::*;
+        match self {
+            Lt => Gt,
+            LtEq => GtEq,
+            Gt => Lt,
+            GtEq => LtEq,
+            other => other,
+        }
+    }
+
     pub fn is_comparison(self) -> bool {
         matches!(
             self,
@@ -514,4 +526,73 @@ fn types_compatible(l: &DataType, r: &DataType) -> bool {
 pub fn fields_for(input: &Schema, exprs: &[Expr]) -> Result<SchemaRef> {
     let fields: Result<Vec<Field>> = exprs.iter().map(|e| e.to_field(input)).collect();
     Ok(Arc::new(Schema::new(fields?)))
+}
+
+// ---- predicate helpers shared by the optimizer and the planner -------------
+
+/// Split an AND-tree into its conjuncts (aliases are looked through).
+pub fn conjuncts(e: &Expr) -> Vec<&Expr> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Alias { expr, .. } => walk(expr, out),
+            other => out.push(other),
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    out
+}
+
+/// Rewrite a single comparison into `column OP literal` form (flipping
+/// `literal OP column`). Returns None for anything else, including NULL
+/// literals. This is the shape the scan can use for row-group pruning.
+pub fn normalize_pushable(e: &Expr) -> Option<Expr> {
+    let Expr::BinaryOp { left, op, right } = e else {
+        return None;
+    };
+    if !op.is_comparison() {
+        return None;
+    }
+    let l = strip_alias(left);
+    let r = strip_alias(right);
+    let (col_side, lit_side, op_for_col_left) = match (l, r) {
+        (Expr::Column(_), Expr::Literal(v)) if *v != ScalarValue::Null => {
+            (l.clone(), Expr::Literal(v.clone()), *op)
+        }
+        (Expr::Literal(v), Expr::Column(_)) if *v != ScalarValue::Null => {
+            (r.clone(), Expr::Literal(v.clone()), op.flip())
+        }
+        _ => return None,
+    };
+    Some(Expr::BinaryOp {
+        left: Box::new(col_side),
+        op: op_for_col_left,
+        right: Box::new(lit_side),
+    })
+}
+
+/// True if every conjunct of `predicate` is one of the scan's `pushdown`
+/// predicates (after normalization). When this holds, a row group the
+/// scan proved `FullMatch` satisfies `predicate` on every row; when it
+/// doesn't (e.g. a column-vs-column conjunct), the scan's classification
+/// says nothing about the conjuncts it never saw.
+pub fn predicate_covered_by(predicate: &Expr, pushdown: &[Expr]) -> bool {
+    conjuncts(predicate)
+        .into_iter()
+        .all(|c| normalize_pushable(c).is_some_and(|n| pushdown.contains(&n)))
+}
+
+fn strip_alias(e: &Expr) -> &Expr {
+    match e {
+        Expr::Alias { expr, .. } => strip_alias(expr),
+        other => other,
+    }
 }

@@ -55,21 +55,6 @@ pub(crate) fn classify_row_groups(
         .collect()
 }
 
-/// Indices of the row groups that might satisfy every predicate, i.e.
-/// everything that isn't `NoMatch`.
-pub(crate) fn surviving_row_groups(
-    metadata: &ParquetMetaData,
-    parquet_root: &Type,
-    predicates: &[Expr],
-) -> Vec<usize> {
-    classify_row_groups(metadata, parquet_root, predicates)
-        .into_iter()
-        .enumerate()
-        .filter(|(_, m)| *m != RowGroupMatch::NoMatch)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Classify one row group against a conjunction: `NoMatch` if any
 /// conjunct is `NoMatch`, `FullMatch` only if every conjunct is.
 pub(crate) fn classify_row_group(

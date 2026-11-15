@@ -568,78 +568,13 @@ fn combine_and(mut conjuncts: Vec<Expr>) -> Expr {
     acc
 }
 
+/// The conjuncts of `e` that the scan can use for row-group pruning, in
+/// `column OP literal` form.
 fn collect_pushable(e: &Expr) -> Vec<Expr> {
-    let mut out = Vec::new();
-    walk_conjunction(e, &mut out);
-    out
-}
-
-fn walk_conjunction(e: &Expr, out: &mut Vec<Expr>) {
-    match e {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            walk_conjunction(left, out);
-            walk_conjunction(right, out);
-        }
-        Expr::Alias { expr, .. } => walk_conjunction(expr, out),
-        other => {
-            if let Some(normalized) = normalize_pushable(other) {
-                out.push(normalized);
-            }
-        }
-    }
-}
-
-fn normalize_pushable(e: &Expr) -> Option<Expr> {
-    let Expr::BinaryOp { left, op, right } = e else {
-        return None;
-    };
-    if !op.is_comparison() {
-        return None;
-    }
-    let l = strip_alias(left);
-    let r = strip_alias(right);
-    let (col_side, lit_side, op_for_col_left) = match (l, r) {
-        (Expr::Column(_), Expr::Literal(v)) if !is_null(v) => {
-            (l.clone(), Expr::Literal(v.clone()), *op)
-        }
-        (Expr::Literal(v), Expr::Column(_)) if !is_null(v) => {
-            (r.clone(), Expr::Literal(v.clone()), flip(*op))
-        }
-        _ => return None,
-    };
-    Some(Expr::BinaryOp {
-        left: Box::new(col_side),
-        op: op_for_col_left,
-        right: Box::new(lit_side),
-    })
-}
-
-fn strip_alias(e: &Expr) -> &Expr {
-    match e {
-        Expr::Alias { expr, .. } => strip_alias(expr),
-        other => other,
-    }
-}
-
-fn is_null(v: &ScalarValue) -> bool {
-    matches!(v, ScalarValue::Null)
-}
-
-fn flip(op: BinaryOperator) -> BinaryOperator {
-    use BinaryOperator::*;
-    match op {
-        Eq => Eq,
-        NotEq => NotEq,
-        Lt => Gt,
-        LtEq => GtEq,
-        Gt => Lt,
-        GtEq => LtEq,
-        And | Or | Plus | Minus | Multiply | Divide => op,
-    }
+    plume_core::conjuncts(e)
+        .into_iter()
+        .filter_map(plume_core::normalize_pushable)
+        .collect()
 }
 
 // =======================================================================
