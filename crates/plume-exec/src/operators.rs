@@ -17,6 +17,7 @@ use plume_core::Expr;
 use crate::compiled::{compile, CompiledExpr};
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::metrics::ScanMetrics;
 use crate::pruning::surviving_row_groups;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -120,6 +121,8 @@ pub struct ParquetScanExec {
     /// the scan tells the parquet reader to stop after `limit` rows.
     limit: Option<usize>,
     batch_size: usize,
+    /// Counters for the most recent execute(); see `crate::metrics`.
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ParquetScanExec {
@@ -131,6 +134,7 @@ impl ParquetScanExec {
             pushdown_predicates: Vec::new(),
             limit: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            metrics: Arc::default(),
         }
     }
 
@@ -146,6 +150,7 @@ impl ParquetScanExec {
             pushdown_predicates: Vec::new(),
             limit: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            metrics: Arc::default(),
         }
     }
 
@@ -157,6 +162,13 @@ impl ParquetScanExec {
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
+    }
+
+    /// Shared handle to this scan's metrics. Keep a clone before wrapping
+    /// the scan in `Arc<dyn ExecutionPlan>`; read it after the stream is
+    /// drained.
+    pub fn metrics(&self) -> Arc<ScanMetrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
@@ -174,18 +186,25 @@ impl ExecutionPlan for ParquetScanExec {
         }
 
         // ---- row-group pruning via pushdown predicates ------------------
-        if !self.pushdown_predicates.is_empty() {
-            let metadata = builder.metadata();
-            let total = metadata.num_row_groups();
-            let root = builder.parquet_schema().root_schema();
-            let surviving = surviving_row_groups(metadata, root, &self.pushdown_predicates);
+        // With no predicates every row group survives.
+        let total = builder.metadata().num_row_groups();
+        let surviving = surviving_row_groups(
+            builder.metadata(),
+            builder.parquet_schema().root_schema(),
+            &self.pushdown_predicates,
+        );
+        self.metrics.reset_for_execute(
+            builder.metadata(),
+            builder.parquet_schema(),
+            self.projection.as_deref(),
+            &surviving,
+        );
 
-            // Only set with_row_groups if we actually pruned some — passing
-            // every group is equivalent to not setting it but lets the
-            // reader take its default code path.
-            if surviving.len() < total {
-                builder = builder.with_row_groups(surviving);
-            }
+        // Only set with_row_groups if we actually pruned some — passing
+        // every group is equivalent to not setting it but lets the
+        // reader take its default code path.
+        if surviving.len() < total {
+            builder = builder.with_row_groups(surviving);
         }
 
         // ---- column projection (Week 8) ---------------------------------
@@ -207,7 +226,12 @@ impl ExecutionPlan for ParquetScanExec {
                 builder.with_projection(mask).build()?
             }
         };
-        Ok(Box::new(reader.map(|r| r.map_err(EvalError::from))))
+        let metrics = Arc::clone(&self.metrics);
+        Ok(Box::new(reader.map(move |r| {
+            let batch = r.map_err(EvalError::from)?;
+            metrics.add_rows_decoded(batch.num_rows());
+            Ok(batch)
+        })))
     }
 }
 

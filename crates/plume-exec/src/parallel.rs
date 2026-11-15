@@ -43,6 +43,7 @@ use rayon::prelude::*;
 
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::metrics::ScanMetrics;
 use crate::pruning;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -56,6 +57,8 @@ pub struct ParallelParquetScanExec {
     /// Cap on parallel workers. None = use rayon's global pool default
     /// (typically `num_cpus`). Set to 1 for a single-threaded sanity run.
     max_workers: Option<usize>,
+    /// Counters for the most recent execute(); see `crate::metrics`.
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ParallelParquetScanExec {
@@ -67,6 +70,7 @@ impl ParallelParquetScanExec {
             pushdown_predicates: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             max_workers: None,
+            metrics: Arc::default(),
         }
     }
 
@@ -82,6 +86,7 @@ impl ParallelParquetScanExec {
             pushdown_predicates: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             max_workers: None,
+            metrics: Arc::default(),
         }
     }
 
@@ -94,6 +99,13 @@ impl ParallelParquetScanExec {
         self.max_workers = Some(n);
         self
     }
+
+    /// Shared handle to this scan's metrics. Keep a clone before wrapping
+    /// the scan in `Arc<dyn ExecutionPlan>`; read it after the stream is
+    /// drained.
+    pub fn metrics(&self) -> Arc<ScanMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 impl ExecutionPlan for ParallelParquetScanExec {
@@ -104,7 +116,12 @@ impl ExecutionPlan for ParallelParquetScanExec {
     fn execute(&self) -> EvalResult<BatchStream> {
         // ---- one cheap metadata pass on the main thread to compute
         //      surviving row groups under any pushdown predicates ----------
-        let surviving = surviving_row_groups(&self.path, &self.pushdown_predicates)?;
+        let surviving = surviving_row_groups(
+            &self.path,
+            &self.pushdown_predicates,
+            self.projection.as_deref(),
+            &self.metrics,
+        )?;
 
         // Snapshot the per-worker config into owned values so the spawned
         // thread doesn't need to borrow self.
@@ -112,6 +129,7 @@ impl ExecutionPlan for ParallelParquetScanExec {
         let projection = self.projection.clone();
         let batch_size = self.batch_size;
         let max_workers = self.max_workers;
+        let metrics = Arc::clone(&self.metrics);
 
         // Channel-based fan-in: each rayon task pushes its batches into the
         // same mpsc, and the foreground iterator pulls them out. The thread
@@ -129,7 +147,8 @@ impl ExecutionPlan for ParallelParquetScanExec {
 
                 let work = || {
                     surviving.par_iter().for_each(|&rg_idx| {
-                        let res = read_row_group(&path, &projection, batch_size, rg_idx, &tx);
+                        let res =
+                            read_row_group(&path, &projection, batch_size, rg_idx, &metrics, &tx);
                         if let Err(e) = res {
                             // Ignore send errors — the receiver may have
                             // dropped after the consumer hit a limit / err.
@@ -157,6 +176,7 @@ fn read_row_group(
     projection: &Option<Vec<String>>,
     batch_size: usize,
     rg_idx: usize,
+    metrics: &ScanMetrics,
     tx: &mpsc::Sender<EvalResult<RecordBatch>>,
 ) -> EvalResult<()> {
     let file = File::open(path)?;
@@ -183,6 +203,9 @@ fn read_row_group(
     let reader = builder.build()?;
     for batch in reader {
         let result = batch.map_err(EvalError::from);
+        if let Ok(b) = &result {
+            metrics.add_rows_decoded(b.num_rows());
+        }
         if tx.send(result).is_err() {
             // Consumer disappeared (e.g. surrounding query short-circuited);
             // stop reading.
@@ -193,18 +216,26 @@ fn read_row_group(
 }
 
 /// Compute the row groups that survive `predicates` against the file's
-/// metadata, using the shared rule in `crate::pruning`. With no
-/// predicates, returns 0..N.
+/// metadata, using the shared rule in `crate::pruning`, and reset
+/// `metrics` for this execute(). With no predicates, returns 0..N.
 fn surviving_row_groups(
     path: &std::path::Path,
     predicates: &[Expr],
+    projection: Option<&[String]>,
+    metrics: &ScanMetrics,
 ) -> EvalResult<Arc<Vec<usize>>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let root = builder.parquet_schema().root_schema();
-    Ok(Arc::new(pruning::surviving_row_groups(
+    let surviving = pruning::surviving_row_groups(
         builder.metadata(),
-        root,
+        builder.parquet_schema().root_schema(),
         predicates,
-    )))
+    );
+    metrics.reset_for_execute(
+        builder.metadata(),
+        builder.parquet_schema(),
+        projection,
+        &surviving,
+    );
+    Ok(Arc::new(surviving))
 }
