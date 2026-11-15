@@ -26,6 +26,10 @@ rows each, with prices in disjoint bands. When the optimizer pushes
 `price > 950` down, only one row group's max value can possibly satisfy
 it, so the parquet reader skips the other seven entirely.
 
+This is a best case by construction: `gen_fixtures` builds the file so
+the bands don't overlap. For what pruning does on real data, see
+[Results](#results).
+
 ```
 $ cargo run -p plume-bench --example parquet_filter
 === optimized plan (note pushdown=[(price > 950)] on the scan) ===
@@ -42,6 +46,18 @@ The Filter stays in the plan after pushdown because row-group min/max
 stats only prove that *no* match exists in a group. They can't prove
 that *every* row in the surviving group matches, so per-row filtering
 still runs.
+
+## Results
+
+How much of a Parquet file does min/max row-group pruning skip on real
+data, how much does data layout change that, and does TPC-H understate
+it the way the [Snowflake pruning paper](https://arxiv.org/abs/2504.11540)
+reports (§8.3)?
+
+[`docs/results-phase1.md`](docs/results-phase1.md) answers that with
+TPC-H SF1 and six months of NYC taxi trips, each written shuffled,
+sorted, and sorted on two columns. Every number there is generated from
+`results/phase1/` by `scripts/report.py`.
 
 ## How nulls work
 
@@ -384,7 +400,9 @@ cargo build --workspace                            # ~3-5 min cold (bundled Duck
 cargo run -p plume-bench --bin gen_fixtures        # CSV + parquet fixtures (incl. customers/orders for joins)
 cargo test --workspace                             # 208 tests
 cargo run -p plume-bench --example join_demo       # or optimizer_demo / csv_aggregate / parquet_filter / group_by_pipeline
-cargo run --release -p plume-bench --bin prepare_datasets   # Phase 1 data: TPC-H SF1 + NYC taxi Jan-Jun 2023 into data/ (gitignored)
+cargo run --release -p plume-bench --bin prepare_datasets   # TPC-H SF1 + NYC taxi Jan-Jun 2023 into data/ (gitignored)
+cargo run --release -p plume-bench --bin prune_bench        # writes results/phase1/
+python3 scripts/report.py                                   # writes docs/results-phase1.md (needs pandas, matplotlib)
 ```
 
 For benchmark methodology and how to interpret `cargo bench` output,

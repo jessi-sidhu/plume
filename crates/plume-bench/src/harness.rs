@@ -141,9 +141,20 @@ pub fn assert_matches_duckdb(
 ) -> Result<()> {
     let expected = duckdb_query(sql, register_csvs, register_parquets)
         .with_context(|| format!("running reference SQL: {sql}"))?;
+    assert_batches_match(actual, &expected, order_sensitive)
+        .with_context(|| format!("result mismatch for SQL `{sql}`"))
+}
 
+/// Compare two results with the same canonical rendering
+/// `assert_matches_duckdb` uses. For callers that already have DuckDB's
+/// batches (e.g. the benchmark runner, which timed the query).
+pub fn assert_batches_match(
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    order_sensitive: bool,
+) -> Result<()> {
     let mut actual_rows = batches_to_rows(actual).context("rendering actual")?;
-    let mut expected_rows = batches_to_rows(&expected).context("rendering expected")?;
+    let mut expected_rows = batches_to_rows(expected).context("rendering expected")?;
 
     if !order_sensitive {
         actual_rows.sort();
@@ -156,7 +167,7 @@ pub fn assert_matches_duckdb(
         let a = actual_rows.iter().take(SHOW).collect::<Vec<_>>();
         let e = expected_rows.iter().take(SHOW).collect::<Vec<_>>();
         bail!(
-            "result mismatch for SQL `{sql}`\n  actual rows ({} total, first {SHOW}):\n{:#?}\n  expected rows ({} total, first {SHOW}):\n{:#?}",
+            "rows differ\n  actual rows ({} total, first {SHOW}):\n{:#?}\n  expected rows ({} total, first {SHOW}):\n{:#?}",
             actual_rows.len(),
             a,
             expected_rows.len(),
