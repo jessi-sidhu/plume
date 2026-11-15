@@ -32,6 +32,10 @@ path = "src/bin/gen_fixtures.rs"
 name = "prepare_datasets"
 path = "src/bin/prepare_datasets.rs"
 
+[[bin]]
+name = "prune_bench"
+path = "src/bin/prune_bench.rs"
+
 [[bench]]
 name = "queries"
 harness = false
