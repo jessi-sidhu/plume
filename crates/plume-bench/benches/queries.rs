@@ -3,22 +3,22 @@
 //! Measure four cuts that exercise the parts of the engine we've optimised:
 //!
 //!   1. project_unoptimized vs project_optimized
-//!         -> column pruning impact (Week 8). The query reads two of five
-//!            columns; the optimizer should drop the other three from the
-//!            Parquet read.
+//!      -> column pruning impact (Week 8). The query reads two of five
+//!      columns; the optimizer should drop the other three from the
+//!      Parquet read.
 //!
 //!   2. filter_unoptimized vs filter_optimized
-//!         -> column pruning + predicate pushdown / row-group skipping
-//!            (Weeks 8-9). `price > 950` survives only the [875, 1000) row
-//!            group — pruning takes 1M -> 125K rows of decode.
+//!      -> column pruning + predicate pushdown / row-group skipping
+//!      (Weeks 8-9). `price > 950` survives only the [875, 1000) row
+//!      group — pruning takes 1M -> 125K rows of decode.
 //!
 //!   3. groupby_unoptimized vs groupby_optimized
-//!         -> the GROUP BY hot path under HashAggregateExec (W6) plus the
-//!            full optimizer pipeline (Weeks 8-10).
+//!      -> the GROUP BY hot path under HashAggregateExec (W6) plus the
+//!      full optimizer pipeline (Weeks 8-10).
 //!
 //!   4. eval_treewalk vs eval_compiled
-//!         -> compiled-expr (Week 11) vs the legacy tree-walking evaluator
-//!            on the predicate `price > 500.0 AND region = 'west'`.
+//!      -> compiled-expr (Week 11) vs the legacy tree-walking evaluator
+//!      on the predicate `price > 500.0 AND region = 'west'`.
 //!
 //! Run with `cargo bench -p plume-bench`. Skip silently if the fixture
 //! isn't present.

@@ -365,11 +365,11 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
                 (
                     false,
                     LogicalPlan::Scan {
-                        source,
+                        source: ScanSource::Parquet { .. },
                         pushdown_predicates: existing,
                         ..
                     },
-                ) if matches!(source, ScanSource::Parquet { .. }) => {
+                ) => {
                     // De-dupe by string form so re-running the rule is idempotent.
                     let mut all = existing.clone();
                     let existing_text: HashSet<String> =

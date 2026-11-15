@@ -287,9 +287,14 @@ impl Expr {
     pub fn minus(self, rhs: Expr) -> Expr {
         binop(self, BinaryOperator::Minus, rhs)
     }
+    // `mul`/`div` are builder combinators in the same family as `plus`/`minus`,
+    // not implementations of `std::ops::{Mul, Div}`. Keeping the names avoids a
+    // public API change.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Expr) -> Expr {
         binop(self, BinaryOperator::Multiply, rhs)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, rhs: Expr) -> Expr {
         binop(self, BinaryOperator::Divide, rhs)
     }
