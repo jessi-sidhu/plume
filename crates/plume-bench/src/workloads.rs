@@ -1,5 +1,8 @@
-//! Phase 1 query set: each query defined once, as a Plume `DataFrame`
-//! builder plus the equivalent DuckDB SQL.
+//! Benchmark queries: each defined once, as a Plume `DataFrame` builder
+//! plus the equivalent DuckDB SQL. `for_dataset` is the Phase 1 set
+//! (filter pruning); `phase2_for_dataset` adds the LIMIT, top-k and join
+//! queries of Phase 2. Every query is tagged with the technique it
+//! measures and how its result is checked.
 //!
 //! The data comes from `prepare_datasets` (see `data/manifest.json`). A
 //! query is written against logical table names, not files: `lineitem`
@@ -36,8 +39,7 @@
 //!   `l_shipmode IN ('MAIL','SHIP')` is written as an OR.
 //! - Q14 (`p_type LIKE 'PROMO%'`, needs LIKE and CASE) and Q13
 //!   (`NOT LIKE`, LEFT JOIN + COUNT over a subquery).
-//! - Top-k queries (`ORDER BY ... LIMIT k`), which the Snowflake paper
-//!   prunes separately (§5); that is Phase 2.
+//! - Top-k queries (`ORDER BY ... LIMIT k`) are in the Phase 2 set.
 //! - Taxi queries on hour-of-day or day-of-week (needs EXTRACT/date
 //!   functions).
 //! - Date arithmetic in predicates (`DATE '1998-12-01' - INTERVAL 90 DAY`):
@@ -45,9 +47,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
+use arrow_array::RecordBatch;
+use duckdb::Connection;
 use plume_core::{avg, col, count_star, lit, lit_date, lit_timestamp, sum, DataFrame, JoinType};
 use plume_io::scan_parquet_auto;
+
+use crate::harness::{assert_batches_match, assert_rows_within, assert_sort_keys_match};
 
 /// Which dataset a query reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,8 +71,58 @@ impl Dataset {
     }
 }
 
-/// The three layouts `prepare_datasets` writes for each fact table.
+/// The three layouts `prepare_datasets` writes for each fact table (the
+/// Phase 1 set).
 pub const LAYOUTS: [&str; 3] = ["random", "sorted", "compound"];
+
+/// Every layout of `dataset`'s fact table: the Phase 1 three, plus
+/// `orderkey` for TPC-H (lineitem sorted by the join key).
+pub fn layouts(dataset: Dataset) -> &'static [&'static str] {
+    match dataset {
+        Dataset::Tpch => &["random", "sorted", "compound", "orderkey"],
+        Dataset::Taxi => &LAYOUTS,
+    }
+}
+
+/// The pruning technique a query is there to measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Technique {
+    /// Min/max pruning on filter predicates (Phase 1, §3).
+    Filter,
+    /// LIMIT pruning (§4).
+    Limit,
+    /// Top-k pruning (§5).
+    TopK,
+    /// Join pruning (§6).
+    Join,
+}
+
+impl Technique {
+    pub fn name(self) -> &'static str {
+        match self {
+            Technique::Filter => "filter",
+            Technique::Limit => "limit",
+            Technique::TopK => "topk",
+            Technique::Join => "join",
+        }
+    }
+}
+
+/// How a query's Plume result is checked against DuckDB.
+pub enum Check {
+    /// The same rows as DuckDB's result for `sql`, in any order.
+    Exact,
+    /// LIMIT without ORDER BY: any `k` matching rows are correct. Exactly
+    /// min(k, matches) rows, each in `unlimited_sql`'s result.
+    Limit { k: usize, unlimited_sql: String },
+    /// ORDER BY ... LIMIT: rows tied on the sort keys may differ. The
+    /// `keys` columns match DuckDB's ordered result row by row, and every
+    /// row is in `unlimited_sql`'s result.
+    TopK {
+        keys: Vec<&'static str>,
+        unlimited_sql: String,
+    },
+}
 
 /// Parquet files for one dataset in one layout, keyed by the table names
 /// the queries use.
@@ -79,7 +135,8 @@ pub struct Tables {
 
 impl Tables {
     /// Files under `data_dir` (the workspace `data/`) for `layout`. Only
-    /// the fact table changes with the layout; `orders` is written once.
+    /// the fact table changes with the layout; `orders` and `zones` are
+    /// written once.
     pub fn new(data_dir: &Path, dataset: Dataset, layout: &str) -> Self {
         let tables = match dataset {
             Dataset::Tpch => vec![
@@ -89,10 +146,13 @@ impl Tables {
                 ),
                 ("orders", data_dir.join("tpch/orders.parquet")),
             ],
-            Dataset::Taxi => vec![(
-                "trips",
-                data_dir.join(format!("taxi/trips_{layout}.parquet")),
-            )],
+            Dataset::Taxi => vec![
+                (
+                    "trips",
+                    data_dir.join(format!("taxi/trips_{layout}.parquet")),
+                ),
+                ("zones", data_dir.join("taxi/zones.parquet")),
+            ],
         };
         Tables {
             dataset,
@@ -136,6 +196,8 @@ pub struct Workload {
     /// Target fraction of rows matched, for the selectivity sweep.
     pub target_selectivity: Option<f64>,
     pub sql: String,
+    pub technique: Technique,
+    pub check: Check,
     build: Builder,
 }
 
@@ -151,6 +213,41 @@ impl Workload {
         );
         (self.build)(tables)
     }
+
+    /// Check Plume's `actual` result. `expected` is DuckDB's result for
+    /// `self.sql`; `conn` has the query's tables registered as views (for
+    /// checks whose reference is too large to pull out of DuckDB).
+    pub fn verify(
+        &self,
+        actual: &[RecordBatch],
+        expected: &[RecordBatch],
+        conn: &Connection,
+    ) -> Result<()> {
+        match &self.check {
+            Check::Exact => assert_batches_match(actual, expected, false),
+            Check::Limit { k, unlimited_sql } => {
+                let total: i64 = conn.query_row(
+                    &format!("SELECT count(*) FROM ({unlimited_sql})"),
+                    [],
+                    |r| r.get(0),
+                )?;
+                let got: usize = actual.iter().map(|b| b.num_rows()).sum();
+                let want = (*k).min(total as usize);
+                ensure!(
+                    got == want,
+                    "LIMIT {k}: got {got} rows, expected min({k}, {total}) = {want}"
+                );
+                assert_rows_within(conn, actual, unlimited_sql)
+            }
+            Check::TopK {
+                keys,
+                unlimited_sql,
+            } => {
+                assert_sort_keys_match(actual, expected, keys)?;
+                assert_rows_within(conn, actual, unlimited_sql)
+            }
+        }
+    }
 }
 
 /// Every Phase 1 query, TPC-H first.
@@ -165,6 +262,16 @@ pub fn for_dataset(dataset: Dataset) -> Vec<Workload> {
         Dataset::Tpch => tpch(),
         Dataset::Taxi => taxi(),
     }
+}
+
+/// The Phase 1 queries plus the Phase 2 LIMIT, top-k and join queries.
+pub fn phase2_for_dataset(dataset: Dataset) -> Vec<Workload> {
+    let mut w = for_dataset(dataset);
+    w.extend(match dataset {
+        Dataset::Tpch => tpch_phase2(),
+        Dataset::Taxi => taxi_phase2(),
+    });
+    w
 }
 
 // ---------------------------------------------------------------------
@@ -195,6 +302,8 @@ fn tpch() -> Vec<Workload> {
                     AND l_discount >= 0.05 AND l_discount <= 0.07 \
                     AND l_quantity < 24"
                 .into(),
+            technique: Technique::Filter,
+            check: Check::Exact,
             build: Box::new(|t| {
                 Ok(t.scan("lineitem")?
                     .filter(
@@ -232,6 +341,8 @@ fn tpch() -> Vec<Workload> {
                   WHERE l_shipdate <= DATE '1998-09-02' \
                   GROUP BY l_returnflag, l_linestatus"
                 .into(),
+            technique: Technique::Filter,
+            check: Check::Exact,
             build: Box::new(|t| {
                 let disc_price = || col("l_extendedprice").mul(lit(1.0).minus(col("l_discount")));
                 Ok(t.scan("lineitem")?
@@ -270,6 +381,8 @@ fn tpch() -> Vec<Workload> {
                     AND l_receiptdate < DATE '1995-01-01' \
                   GROUP BY l_shipmode, o_orderpriority"
                 .into(),
+            technique: Technique::Filter,
+            check: Check::Exact,
             build: Box::new(|t| {
                 Ok(t.scan("lineitem")?
                     .join(
@@ -304,6 +417,8 @@ fn tpch() -> Vec<Workload> {
                  FROM lineitem \
                  WHERE l_shipdate >= DATE '{lo}' AND l_shipdate < DATE '{hi}'"
             ),
+            technique: Technique::Filter,
+            check: Check::Exact,
             build: Box::new(move |t| {
                 Ok(t.scan("lineitem")?
                     .filter(
@@ -364,6 +479,8 @@ fn taxi() -> Vec<Workload> {
                  WHERE tpep_pickup_datetime >= TIMESTAMP '{lo}' \
                    AND tpep_pickup_datetime < TIMESTAMP '{hi}'"
             ),
+            technique: Technique::Filter,
+            check: Check::Exact,
             build: Box::new(move |t| {
                 Ok(t.scan("trips")?
                     .filter(
@@ -390,6 +507,8 @@ fn taxi() -> Vec<Workload> {
             "SELECT count(*) AS n, avg(trip_distance) AS avg_distance \
              FROM trips WHERE fare_amount > {TAXI_FARE_THRESHOLD:?}"
         ),
+        technique: Technique::Filter,
+        check: Check::Exact,
         build: Box::new(|t| {
             Ok(t.scan("trips")?
                 .filter(col("fare_amount").gt(lit(TAXI_FARE_THRESHOLD)))?
@@ -411,6 +530,8 @@ fn taxi() -> Vec<Workload> {
             "SELECT count(*) AS n, sum(total_amount) AS sum_total \
              FROM trips WHERE PULocationID = {TAXI_PU_LOCATION}"
         ),
+        technique: Technique::Filter,
+        check: Check::Exact,
         build: Box::new(|t| {
             Ok(t.scan("trips")?
                 .filter(col("PULocationID").eq(lit(TAXI_PU_LOCATION)))?
@@ -423,5 +544,249 @@ fn taxi() -> Vec<Workload> {
                 )?)
         }),
     });
+    out
+}
+
+// ---------------------------------------------------------------------
+// Phase 2: LIMIT, top-k and join queries
+// ---------------------------------------------------------------------
+
+/// Rows the LIMIT queries ask for.
+const LIMIT_K: usize = 100;
+
+/// `SELECT <cols> FROM <table> WHERE <where> LIMIT k`, checked with
+/// `Check::Limit`.
+fn limit_workload(
+    dataset: Dataset,
+    name: String,
+    target: f64,
+    table: &'static str,
+    cols: &'static [&'static str],
+    where_sql: String,
+    filter: impl Fn() -> plume_core::Expr + Send + Sync + 'static,
+) -> Workload {
+    let select = cols.join(", ");
+    let unlimited_sql = format!("SELECT {select} FROM {table} WHERE {where_sql}");
+    Workload {
+        dataset,
+        name,
+        target_selectivity: Some(target),
+        sql: format!("{unlimited_sql} LIMIT {LIMIT_K}"),
+        technique: Technique::Limit,
+        check: Check::Limit {
+            k: LIMIT_K,
+            unlimited_sql,
+        },
+        build: Box::new(move |t| {
+            Ok(t.scan(table)?
+                .filter(filter())?
+                .project(cols.iter().map(|c| col(*c)).collect())?
+                .limit(LIMIT_K))
+        }),
+    }
+}
+
+/// `SELECT <cols> FROM <table> ORDER BY <key> DESC LIMIT k`, checked with
+/// `Check::TopK`.
+fn top_k_workload(
+    dataset: Dataset,
+    name: &str,
+    table: &'static str,
+    cols: &'static [&'static str],
+    key: &'static str,
+    k: usize,
+) -> Workload {
+    let select = cols.join(", ");
+    Workload {
+        dataset,
+        name: name.into(),
+        target_selectivity: None,
+        sql: format!("SELECT {select} FROM {table} ORDER BY {key} DESC LIMIT {k}"),
+        technique: Technique::TopK,
+        check: Check::TopK {
+            keys: vec![key],
+            unlimited_sql: format!("SELECT {select} FROM {table}"),
+        },
+        build: Box::new(move |t| {
+            Ok(t.scan(table)?
+                .project(cols.iter().map(|c| col(*c)).collect())?
+                .sort(vec![col(key).desc()])?
+                .limit(k))
+        }),
+    }
+}
+
+const TPCH_LIMIT_COLS: &[&str] = &[
+    "l_orderkey",
+    "l_linenumber",
+    "l_shipdate",
+    "l_extendedprice",
+];
+
+fn tpch_phase2() -> Vec<Workload> {
+    let mut out = Vec::new();
+    for (label, target, lo, hi) in TPCH_SWEEP {
+        out.push(limit_workload(
+            Dataset::Tpch,
+            format!("tpch_limit_{label}"),
+            target,
+            "lineitem",
+            TPCH_LIMIT_COLS,
+            format!("l_shipdate >= DATE '{lo}' AND l_shipdate < DATE '{hi}'"),
+            move || {
+                col("l_shipdate")
+                    .gt_eq(lit_date(lo))
+                    .and(col("l_shipdate").lt(lit_date(hi)))
+            },
+        ));
+    }
+    out.push(top_k_workload(
+        Dataset::Tpch,
+        "tpch_topk_extendedprice_10",
+        "lineitem",
+        &["l_orderkey", "l_linenumber", "l_extendedprice"],
+        "l_extendedprice",
+        10,
+    ));
+    out.push(top_k_workload(
+        Dataset::Tpch,
+        "tpch_topk_shipdate_100",
+        "lineitem",
+        &["l_orderkey", "l_linenumber", "l_shipdate"],
+        "l_shipdate",
+        100,
+    ));
+    // lineitem probes, a filtered orders is the build side. One week of
+    // order dates: dbgen draws o_orderdate independently of o_orderkey,
+    // so those orders' keys span almost the whole key range.
+    out.push(tpch_join_workload(
+        "tpch_join_orderdate_week",
+        "o_orderdate >= DATE '1995-03-01' AND o_orderdate < DATE '1995-03-08'",
+        || {
+            col("o_orderdate")
+                .gt_eq(lit_date("1995-03-01"))
+                .and(col("o_orderdate").lt(lit_date("1995-03-08")))
+        },
+    ));
+    // The first 1% of the key range: the case where the build keys are
+    // contiguous, to show what the orderkey layout makes possible.
+    out.push(tpch_join_workload(
+        "tpch_join_orderkey_1pct",
+        "o_orderkey < 60000",
+        || col("o_orderkey").lt(lit(60_000i64)),
+    ));
+    out
+}
+
+fn tpch_join_workload(
+    name: &str,
+    orders_where: &'static str,
+    filter: impl Fn() -> plume_core::Expr + Send + Sync + 'static,
+) -> Workload {
+    Workload {
+        dataset: Dataset::Tpch,
+        name: name.into(),
+        target_selectivity: None,
+        sql: format!(
+            "SELECT count(*) AS n, sum(l_extendedprice) AS revenue \
+             FROM lineitem JOIN orders ON l_orderkey = o_orderkey WHERE {orders_where}"
+        ),
+        technique: Technique::Join,
+        check: Check::Exact,
+        build: Box::new(move |t| {
+            Ok(t.scan("lineitem")?
+                .join(
+                    t.scan("orders")?.filter(filter())?,
+                    vec![(col("l_orderkey"), col("o_orderkey"))],
+                    JoinType::Inner,
+                )?
+                .aggregate(
+                    vec![],
+                    vec![
+                        count_star().alias("n"),
+                        sum(col("l_extendedprice")).alias("revenue"),
+                    ],
+                )?)
+        }),
+    }
+}
+
+const TAXI_LIMIT_COLS: &[&str] = &[
+    "tpep_pickup_datetime",
+    "PULocationID",
+    "DOLocationID",
+    "fare_amount",
+];
+
+fn taxi_phase2() -> Vec<Workload> {
+    let mut out = Vec::new();
+    for (label, target, lo, hi) in TAXI_SWEEP {
+        out.push(limit_workload(
+            Dataset::Taxi,
+            format!("taxi_limit_{label}"),
+            target,
+            "trips",
+            TAXI_LIMIT_COLS,
+            format!(
+                "tpep_pickup_datetime >= TIMESTAMP '{lo}' AND tpep_pickup_datetime < TIMESTAMP '{hi}'"
+            ),
+            move || {
+                col("tpep_pickup_datetime")
+                    .gt_eq(lit_timestamp(lo))
+                    .and(col("tpep_pickup_datetime").lt(lit_timestamp(hi)))
+            },
+        ));
+    }
+    out.push(top_k_workload(
+        Dataset::Taxi,
+        "taxi_topk_fare_10",
+        "trips",
+        &["tpep_pickup_datetime", "PULocationID", "fare_amount"],
+        "fare_amount",
+        10,
+    ));
+    out.push(top_k_workload(
+        Dataset::Taxi,
+        "taxi_topk_pickup_100",
+        "trips",
+        &["tpep_pickup_datetime", "PULocationID", "fare_amount"],
+        "tpep_pickup_datetime",
+        100,
+    ));
+    // trips probes, the zones of one borough are the build side. A
+    // borough's zone IDs aren't contiguous (Manhattan's span 4..263), so
+    // the build range covers most IDs; EWR is the single zone 1.
+    for (name, borough) in [
+        ("taxi_join_zones_manhattan", "Manhattan"),
+        ("taxi_join_zones_ewr", "EWR"),
+    ] {
+        out.push(Workload {
+            dataset: Dataset::Taxi,
+            name: name.into(),
+            target_selectivity: None,
+            sql: format!(
+                "SELECT count(*) AS n, sum(fare_amount) AS sum_fare \
+                 FROM trips JOIN zones ON PULocationID = LocationID \
+                 WHERE Borough = '{borough}'"
+            ),
+            technique: Technique::Join,
+            check: Check::Exact,
+            build: Box::new(move |t| {
+                Ok(t.scan("trips")?
+                    .join(
+                        t.scan("zones")?.filter(col("Borough").eq(lit(borough)))?,
+                        vec![(col("PULocationID"), col("LocationID"))],
+                        JoinType::Inner,
+                    )?
+                    .aggregate(
+                        vec![],
+                        vec![
+                            count_star().alias("n"),
+                            sum(col("fare_amount")).alias("sum_fare"),
+                        ],
+                    )?)
+            }),
+        });
+    }
     out
 }

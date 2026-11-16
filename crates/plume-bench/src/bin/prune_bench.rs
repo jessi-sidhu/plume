@@ -21,9 +21,24 @@
 //!
 //! Writes results/phase1/pruning.csv and results/phase1/env.json.
 //!
+//! With `--phase 2` it measures all four techniques instead: every query
+//! in `workloads::phase2_for_dataset` on every layout of
+//! `workloads::layouts`, each run with its own technique on and off and
+//! every other technique left on:
+//!   - filter: off = pushdown predicates cleared (as in Phase 1)
+//!   - limit:  off = the optimizer without the LimitPruning rule
+//!   - topk:   off = `PlannerOptions::top_k_pruning = false`
+//!   - join:   off = `PlannerOptions::join_pruning = false`
+//!
+//! Results are checked with `Workload::verify` in both modes. Each
+//! technique's own skip counter is recorded next to the general scan
+//! metrics, in results/phase2/techniques.csv (plus env.json).
+//!
 //!     cargo run --release -p plume-bench --bin prune_bench
+//!     cargo run --release -p plume-bench --bin prune_bench -- --phase 2
 //!
 //! Options:
+//!     --phase 1|2         which measurement to run (default 1)
 //!     --runs <n>          timed runs per measurement (default 5)
 //!     --dataset tpch|taxi only run one dataset
 //!     --query <substr>    only run queries whose name contains this
@@ -41,17 +56,29 @@ use arrow_array::RecordBatch;
 use duckdb::Connection;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use plume_bench::harness::assert_batches_match;
-use plume_bench::workloads::{self, Dataset, Tables, Workload, LAYOUTS};
+use plume_bench::workloads::{self, Dataset, Tables, Technique, Workload, LAYOUTS};
 use plume_core::LogicalPlan;
-use plume_exec::{create_physical_plan_with_metrics, EvalResult, ScanMetricsSnapshot};
-use plume_optimizer::Optimizer;
+use plume_exec::{
+    create_physical_plan_with_metrics, create_physical_plan_with_options, EvalResult,
+    PlannerOptions, ScanMetricsSnapshot,
+};
+use plume_optimizer::{
+    ColumnPruning, ConstantFolding, DeadProjectionElim, LimitPushdown, Optimizer,
+    PredicatePushdown, SortLimitToTopK,
+};
 use serde_json::json;
 
 const CSV_HEADER: &str = "dataset,layout,query,target_selectivity,actual_selectivity,pruning,\
 row_groups_total,row_groups_pruned,bytes_total,bytes_read,rows_decoded,rows_in_file,\
 plume_ms,duckdb_ms";
 
+const PHASE2_HEADER: &str = "dataset,layout,query,technique,target_selectivity,\
+actual_selectivity,mode,row_groups_total,row_groups_pruned,row_groups_pruned_limit,\
+row_groups_pruned_topk,row_groups_pruned_join,row_groups_read,bytes_total,bytes_read,\
+rows_decoded,rows_in_file,plume_ms,duckdb_ms";
+
 struct Args {
+    phase: u8,
     runs: usize,
     datasets: Vec<Dataset>,
     query: Option<String>,
@@ -59,6 +86,7 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut args = Args {
+        phase: 1,
         runs: 5,
         datasets: vec![Dataset::Tpch, Dataset::Taxi],
         query: None,
@@ -77,6 +105,11 @@ fn parse_args() -> Result<Args> {
                 other => bail!("--dataset expects tpch or taxi, got {other:?}"),
             },
             "--query" => args.query = Some(it.next().context("--query needs a value")?),
+            "--phase" => match it.next().as_deref() {
+                Some("1") => args.phase = 1,
+                Some("2") => args.phase = 2,
+                other => bail!("--phase expects 1 or 2, got {other:?}"),
+            },
             other => bail!("unknown argument {other}"),
         }
     }
@@ -93,6 +126,9 @@ fn workspace_root() -> PathBuf {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    if args.phase == 2 {
+        return phase2(&args);
+    }
     let root = workspace_root();
     let data = root.join("data");
     let out_dir = root.join("results").join("phase1");
@@ -138,6 +174,151 @@ fn main() -> Result<()> {
     )?;
     println!("wrote {} and {}", csv_path.display(), env_path.display());
     Ok(())
+}
+
+fn phase2(args: &Args) -> Result<()> {
+    let root = workspace_root();
+    let data = root.join("data");
+    let out_dir = root.join("results").join("phase2");
+    fs::create_dir_all(&out_dir)?;
+
+    let mut csv = String::from(PHASE2_HEADER);
+    csv.push('\n');
+    for &dataset in &args.datasets {
+        let queries: Vec<Workload> = workloads::phase2_for_dataset(dataset)
+            .into_iter()
+            .filter(|w| args.query.as_ref().map_or(true, |q| w.name.contains(q)))
+            .collect();
+        for layout in workloads::layouts(dataset) {
+            let tables = Tables::new(&data, dataset, layout);
+            ensure!(
+                tables.exist(),
+                "{} {layout} data missing; run \
+                 `cargo run --release -p plume-bench --bin prepare_datasets`",
+                dataset.name()
+            );
+            let fact = match dataset {
+                Dataset::Tpch => "lineitem",
+                Dataset::Taxi => "trips",
+            };
+            let rows_in_file = parquet_rows(tables.path(fact)?)?;
+            let duck = duckdb_connection(&tables)?;
+            for q in &queries {
+                for line in measure_technique(q, &tables, &duck, rows_in_file, args.runs)? {
+                    csv.push_str(&line);
+                    csv.push('\n');
+                }
+            }
+        }
+    }
+    let csv_path = out_dir.join("techniques.csv");
+    fs::write(&csv_path, csv)?;
+    let env_path = out_dir.join("env.json");
+    fs::write(
+        &env_path,
+        serde_json::to_string_pretty(&env_info(args)?)? + "\n",
+    )?;
+    println!("wrote {} and {}", csv_path.display(), env_path.display());
+    Ok(())
+}
+
+/// The default optimizer without LimitPruning: the "off" plan for LIMIT
+/// queries.
+fn without_limit_pruning() -> Optimizer {
+    Optimizer::with_rules(vec![
+        Box::new(ConstantFolding),
+        Box::new(DeadProjectionElim),
+        Box::new(PredicatePushdown),
+        Box::new(ColumnPruning),
+        Box::new(LimitPushdown),
+        Box::new(SortLimitToTopK),
+    ])
+}
+
+/// Phase 2: run one query with its technique off and on, verify both, and
+/// return the CSV lines.
+fn measure_technique(
+    q: &Workload,
+    tables: &Tables,
+    duck: &Connection,
+    rows_in_file: u64,
+    runs: usize,
+) -> Result<Vec<String>> {
+    let ctx = format!("{} {} {}", tables.dataset.name(), tables.layout, q.name);
+    let raw = q.plan(tables)?.into_plan();
+    let on_plan = Optimizer::default().optimize(raw.clone())?;
+    let on_opts = PlannerOptions::default();
+    let (off_plan, off_opts) = match q.technique {
+        Technique::Filter => (strip_pushdown(on_plan.clone()), on_opts),
+        Technique::Limit => (without_limit_pruning().optimize(raw)?, on_opts),
+        Technique::TopK => (
+            on_plan.clone(),
+            PlannerOptions {
+                top_k_pruning: false,
+                ..on_opts
+            },
+        ),
+        Technique::Join => (
+            on_plan.clone(),
+            PlannerOptions {
+                join_pruning: false,
+                ..on_opts
+            },
+        ),
+    };
+
+    let (duck_time, expected) = time_runs(runs, || duckdb_run(duck, &q.sql))?;
+
+    let mut lines = Vec::new();
+    for (mode, plan, opts) in [("off", &off_plan, off_opts), ("on", &on_plan, on_opts)] {
+        let (plume_time, (batches, metrics)) = time_runs(runs, || plume_run_with(plan, opts))?;
+        q.verify(&batches, &expected, duck)
+            .with_context(|| format!("{ctx} {} {mode}: wrong result", q.technique.name()))?;
+        let m = metrics
+            .first()
+            .copied()
+            .with_context(|| format!("{ctx}: plan has no Parquet scan"))?;
+        let selectivity = sum_n(&batches)
+            .ok()
+            .map(|n| format!("{:.6}", n as f64 / rows_in_file as f64))
+            .unwrap_or_default();
+        let mut line = String::new();
+        write!(
+            line,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3}",
+            tables.dataset.name(),
+            tables.layout,
+            q.name,
+            q.technique.name(),
+            q.target_selectivity
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+            selectivity,
+            mode,
+            m.row_groups_total,
+            m.row_groups_pruned,
+            m.row_groups_pruned_limit,
+            m.row_groups_pruned_topk,
+            m.row_groups_pruned_join,
+            m.row_groups_read,
+            m.bytes_total,
+            m.bytes_read,
+            m.rows_decoded,
+            rows_in_file,
+            ms(plume_time),
+            ms(duck_time),
+        )?;
+        println!(
+            "{ctx:<44} {:<6} {mode:<3}  read {:>3}/{:<3} groups  plume {:>9.1} ms  duckdb {:>8.1} ms",
+            q.technique.name(),
+            m.row_groups_read,
+            m.row_groups_total,
+            ms(plume_time),
+            ms(duck_time)
+        );
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 /// Run one query in every mode and return its CSV lines.
@@ -211,6 +392,15 @@ fn time_runs<T>(runs: usize, mut f: impl FnMut() -> Result<T>) -> Result<(Durati
     }
     times.sort();
     Ok((times[runs / 2], last.expect("runs > 0")))
+}
+
+fn plume_run_with(
+    plan: &LogicalPlan,
+    opts: PlannerOptions,
+) -> Result<(Vec<RecordBatch>, Vec<ScanMetricsSnapshot>)> {
+    let (exec, handles) = create_physical_plan_with_options(plan, opts)?;
+    let batches = exec.execute()?.collect::<EvalResult<Vec<_>>>()?;
+    Ok((batches, handles.iter().map(|h| h.snapshot()).collect()))
 }
 
 fn plume_run(plan: &LogicalPlan) -> Result<(Vec<RecordBatch>, Vec<ScanMetricsSnapshot>)> {
@@ -391,7 +581,11 @@ fn env_info(args: &Args) -> Result<serde_json::Value> {
     let duckdb_threads: i64 =
         duck.query_row("SELECT current_setting('threads')", [], |r| r.get(0))?;
     Ok(json!({
-        "command": "cargo run --release -p plume-bench --bin prune_bench",
+        "command": if args.phase == 2 {
+            "cargo run --release -p plume-bench --bin prune_bench -- --phase 2"
+        } else {
+            "cargo run --release -p plume-bench --bin prune_bench"
+        },
         "date_utc": command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         "git_commit": sha,
         "git_dirty": dirty,
