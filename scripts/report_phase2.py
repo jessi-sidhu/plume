@@ -289,11 +289,16 @@ def findings(on, p, env):
                 best["layout"], best["plume_ms_off"], best["plume_ms"],
             )
         )
-    idle = p[(p["skipped"] == 0)]
-    noise = (100.0 * (idle["plume_ms"] - idle["plume_ms_off"]).abs() / idle["plume_ms_off"]).max()
+    idle = p[(p["skipped"] == 0)].copy()
+    idle["diff"] = 100.0 * (idle["plume_ms"] - idle["plume_ms_off"]).abs() / idle["plume_ms_off"]
+    worst = idle.loc[idle["diff"].idxmax()]
     out.append(
-        "- **Timing noise:** where a technique skipped nothing, off and on do the same work; "
-        "their medians differ by up to {}.".format(pct(noise))
+        "- **Timing noise:** where a technique skipped nothing, off and on do the same work. "
+        "Their medians differ by {} at the median and {} at most (`{}` on {} {}: {:.1f} ms "
+        "vs {:.1f} ms; very short queries are the noisiest in relative terms).".format(
+            pct(idle["diff"].median()), pct(worst["diff"]), worst["query"], worst["dataset"],
+            worst["layout"], worst["plume_ms_off"], worst["plume_ms"],
+        )
     )
     return out
 
