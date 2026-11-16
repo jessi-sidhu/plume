@@ -17,7 +17,8 @@ use plume_core::SortExpr;
 use crate::compiled::{compile, CompiledExpr};
 use crate::eval::EvalResult;
 use crate::exec::{BatchStream, ExecutionPlan};
-use crate::topk_pruning::{TopKBoundary, TopKValue};
+use crate::stat_value::StatValue;
+use crate::topk_pruning::TopKBoundary;
 
 /// A sort key compiled against the input schema.
 #[derive(Clone)]
@@ -273,7 +274,7 @@ impl ExecutionPlan for TopKExec {
             if let (true, Some(boundary)) = (changed, &self.boundary) {
                 if let Some((batch, row)) = heap.kth() {
                     let first = self.keys[0].expr.evaluate(batch)?;
-                    boundary.set(TopKValue::from_array(&first, row));
+                    boundary.set(StatValue::from_array(&first, row));
                 }
             }
         }

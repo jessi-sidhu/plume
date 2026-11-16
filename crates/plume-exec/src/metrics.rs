@@ -26,6 +26,7 @@ pub struct ScanMetrics {
     row_groups_pruned_limit: AtomicU64,
     row_groups_read: AtomicU64,
     row_groups_pruned_topk: AtomicU64,
+    row_groups_pruned_join: AtomicU64,
     /// Whether the batch the scan yielded most recently came from
     /// FullMatch row groups. Not a counter: it's how the scan tells a
     /// FilterExec directly above it that a batch needs no filtering. Only
@@ -39,7 +40,7 @@ pub struct ScanMetrics {
 pub struct ScanMetricsSnapshot {
     /// Row groups in the file.
     pub row_groups_total: u64,
-    /// Row groups skipped by min/max pruning.
+    /// Row groups skipped by min/max pruning on the pushdown predicates.
     pub row_groups_pruned: u64,
     /// Rows produced by the Parquet decoder (before any downstream Filter).
     pub rows_decoded: u64,
@@ -64,6 +65,9 @@ pub struct ScanMetricsSnapshot {
     /// Surviving row groups skipped because a TopK above already held k
     /// rows strictly better than anything the group could contain.
     pub row_groups_pruned_topk: u64,
+    /// Row groups left after min/max pruning that a join's build-side key
+    /// range ruled out. Not included in `row_groups_pruned`.
+    pub row_groups_pruned_join: u64,
 }
 
 impl ScanMetrics {
@@ -102,6 +106,9 @@ impl ScanMetrics {
         self.row_groups_pruned_topk.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_sub(bytes, Ordering::Relaxed);
     }
+    pub fn row_groups_pruned_join(&self) -> u64 {
+        self.row_groups_pruned_join.load(Ordering::Relaxed)
+    }
     pub(crate) fn add_row_group_read(&self) {
         self.row_groups_read.fetch_add(1, Ordering::Relaxed);
     }
@@ -129,11 +136,13 @@ impl ScanMetrics {
             row_groups_pruned_limit: self.row_groups_pruned_limit(),
             row_groups_read: self.row_groups_read(),
             row_groups_pruned_topk: self.row_groups_pruned_topk(),
+            row_groups_pruned_join: self.row_groups_pruned_join(),
         }
     }
 
     /// Start of an `execute()` call: record the file-level numbers and
-    /// zero `rows_decoded`.
+    /// zero `rows_decoded`. `surviving` excludes the `pruned_join` groups.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reset_for_execute(
         &self,
         metadata: &ParquetMetaData,
@@ -142,12 +151,17 @@ impl ScanMetrics {
         surviving: &[usize],
         read: &[usize],
         full_match: usize,
+        pruned_join: usize,
     ) {
         let total = metadata.num_row_groups();
         let all: Vec<usize> = (0..total).collect();
         self.row_groups_total.store(total as u64, Ordering::Relaxed);
-        self.row_groups_pruned
-            .store((total - surviving.len()) as u64, Ordering::Relaxed);
+        self.row_groups_pruned.store(
+            (total - surviving.len() - pruned_join) as u64,
+            Ordering::Relaxed,
+        );
+        self.row_groups_pruned_join
+            .store(pruned_join as u64, Ordering::Relaxed);
         self.bytes_total.store(
             projected_chunk_bytes(metadata, schema, projection, &all),
             Ordering::Relaxed,

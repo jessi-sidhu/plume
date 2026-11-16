@@ -12,6 +12,7 @@ pub mod compiled;
 pub mod eval;
 pub mod exec;
 pub mod join;
+pub mod join_pruning;
 pub mod keys;
 pub mod metrics;
 pub mod operators;
@@ -19,6 +20,7 @@ pub mod parallel;
 pub mod planner;
 mod pruning;
 pub mod sort;
+pub mod stat_value;
 pub mod topk_pruning;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
@@ -26,6 +28,7 @@ pub use compiled::{compile, CompiledExpr};
 pub use eval::{evaluate, evaluate_predicate, EvalError, EvalResult};
 pub use exec::{BatchStream, ExecutionPlan};
 pub use join::{CrossJoinExec, HashJoinExec};
+pub use join_pruning::{JoinFilter, JoinKeyRange, JoinPruning};
 pub use metrics::{ScanMetrics, ScanMetricsSnapshot};
 pub use operators::{
     CsvScanExec, FilterExec, LimitExec, MemoryExec, ParquetScanExec, ProjectionExec,
@@ -37,4 +40,5 @@ pub use planner::{
     PlannerOptions,
 };
 pub use sort::{SortExec, TopKExec};
-pub use topk_pruning::{TopKBoundary, TopKPruning, TopKValue};
+pub use stat_value::StatValue;
+pub use topk_pruning::{TopKBoundary, TopKPruning};
