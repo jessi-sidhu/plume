@@ -177,6 +177,45 @@ pub fn assert_batches_match(
     Ok(())
 }
 
+/// Check a `LIMIT k` result that has no ORDER BY. Any k matching rows are
+/// a valid answer, so rows aren't compared one to one. Instead:
+///
+/// - exactly `min(k, total matches)` rows came back, and
+/// - every returned row is in `unlimited` (DuckDB's result for the same
+///   query without the LIMIT), counted as a multiset so a duplicated row
+///   can't be returned more often than it exists.
+///
+/// The second check also proves every row satisfies the predicate, since
+/// `unlimited` holds exactly the rows that do.
+pub fn assert_valid_limit_result(
+    actual: &[RecordBatch],
+    unlimited: &[RecordBatch],
+    k: usize,
+) -> Result<()> {
+    let actual_rows = batches_to_rows(actual).context("rendering actual")?;
+    let expected_rows = batches_to_rows(unlimited).context("rendering unlimited")?;
+    let want = k.min(expected_rows.len());
+    if actual_rows.len() != want {
+        bail!(
+            "LIMIT {k}: got {} rows, expected min({k}, {}) = {want}",
+            actual_rows.len(),
+            expected_rows.len()
+        );
+    }
+    let mut available: std::collections::HashMap<&Vec<String>, usize> =
+        std::collections::HashMap::new();
+    for r in &expected_rows {
+        *available.entry(r).or_default() += 1;
+    }
+    for r in &actual_rows {
+        match available.get_mut(r) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => bail!("LIMIT {k}: row {r:?} is not in the unlimited result"),
+        }
+    }
+    Ok(())
+}
+
 /// Write a single batch to a fresh Parquet file inside `dir`. Returns the
 /// path. Used by Week-3 evaluator tests that need DuckDB to see the same
 /// input the plume evaluator just consumed.

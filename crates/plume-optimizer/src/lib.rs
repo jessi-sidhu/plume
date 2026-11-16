@@ -7,6 +7,7 @@
 //!   3. PredicatePushdown       — push col-OP-lit predicates into Parquet scans
 //!   4. ColumnPruning           — restrict scans to required columns
 //!   5. LimitPushdown           — fold a top-level Limit into the Scan
+//!   6. LimitPruning            — tell a filtered scan how many rows a Limit needs
 //!
 //! Order matters. Pushdown writes predicate columns into the Scan's
 //! pushdown list; column pruning then has to keep those columns. Limit
@@ -46,6 +47,7 @@ impl Default for Optimizer {
                 Box::new(PredicatePushdown),
                 Box::new(ColumnPruning),
                 Box::new(LimitPushdown),
+                Box::new(LimitPruning),
             ],
             max_passes: 8,
         }
@@ -135,6 +137,7 @@ fn prune_with_required(
             projection,
             pushdown_predicates,
             limit,
+            limit_hint,
         } => {
             if matches!(source, ScanSource::Csv { .. }) {
                 return Ok(LogicalPlan::Scan {
@@ -143,6 +146,7 @@ fn prune_with_required(
                     projection,
                     pushdown_predicates,
                     limit,
+                    limit_hint,
                 });
             }
             if projection.is_some() {
@@ -152,6 +156,7 @@ fn prune_with_required(
                     projection,
                     pushdown_predicates,
                     limit,
+                    limit_hint,
                 });
             }
             // Predicate columns must be retained even though the predicate
@@ -174,6 +179,7 @@ fn prune_with_required(
                     projection: None,
                     pushdown_predicates,
                     limit,
+                    limit_hint,
                 });
             }
             let kept = if kept.is_empty() {
@@ -183,7 +189,8 @@ fn prune_with_required(
             };
             let scan = LogicalPlan::scan_with_projection(source, schema, kept)?;
             let scan = LogicalPlan::with_pushdown_predicates(scan, pushdown_predicates)?;
-            LogicalPlan::with_scan_limit(scan, limit)
+            let scan = LogicalPlan::with_scan_limit(scan, limit)?;
+            LogicalPlan::with_scan_limit_hint(scan, limit_hint)
         }
         LogicalPlan::Filter {
             input,
@@ -568,78 +575,13 @@ fn combine_and(mut conjuncts: Vec<Expr>) -> Expr {
     acc
 }
 
+/// The conjuncts of `e` that the scan can use for row-group pruning, in
+/// `column OP literal` form.
 fn collect_pushable(e: &Expr) -> Vec<Expr> {
-    let mut out = Vec::new();
-    walk_conjunction(e, &mut out);
-    out
-}
-
-fn walk_conjunction(e: &Expr, out: &mut Vec<Expr>) {
-    match e {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            walk_conjunction(left, out);
-            walk_conjunction(right, out);
-        }
-        Expr::Alias { expr, .. } => walk_conjunction(expr, out),
-        other => {
-            if let Some(normalized) = normalize_pushable(other) {
-                out.push(normalized);
-            }
-        }
-    }
-}
-
-fn normalize_pushable(e: &Expr) -> Option<Expr> {
-    let Expr::BinaryOp { left, op, right } = e else {
-        return None;
-    };
-    if !op.is_comparison() {
-        return None;
-    }
-    let l = strip_alias(left);
-    let r = strip_alias(right);
-    let (col_side, lit_side, op_for_col_left) = match (l, r) {
-        (Expr::Column(_), Expr::Literal(v)) if !is_null(v) => {
-            (l.clone(), Expr::Literal(v.clone()), *op)
-        }
-        (Expr::Literal(v), Expr::Column(_)) if !is_null(v) => {
-            (r.clone(), Expr::Literal(v.clone()), flip(*op))
-        }
-        _ => return None,
-    };
-    Some(Expr::BinaryOp {
-        left: Box::new(col_side),
-        op: op_for_col_left,
-        right: Box::new(lit_side),
-    })
-}
-
-fn strip_alias(e: &Expr) -> &Expr {
-    match e {
-        Expr::Alias { expr, .. } => strip_alias(expr),
-        other => other,
-    }
-}
-
-fn is_null(v: &ScalarValue) -> bool {
-    matches!(v, ScalarValue::Null)
-}
-
-fn flip(op: BinaryOperator) -> BinaryOperator {
-    use BinaryOperator::*;
-    match op {
-        Eq => Eq,
-        NotEq => NotEq,
-        Lt => Gt,
-        LtEq => GtEq,
-        Gt => Lt,
-        GtEq => LtEq,
-        And | Or | Plus | Minus | Multiply | Divide => op,
-    }
+    plume_core::conjuncts(e)
+        .into_iter()
+        .filter_map(plume_core::normalize_pushable)
+        .collect()
 }
 
 // =======================================================================
@@ -985,6 +927,7 @@ fn try_fold_limit(plan: LogicalPlan, n: usize) -> Result<FoldResult> {
             projection,
             pushdown_predicates,
             limit,
+            limit_hint,
         } => {
             // Honour the smaller of any pre-existing scan limit and the new one.
             let merged = match limit {
@@ -997,6 +940,7 @@ fn try_fold_limit(plan: LogicalPlan, n: usize) -> Result<FoldResult> {
                 projection,
                 pushdown_predicates,
                 limit: merged,
+                limit_hint,
             };
             Ok(FoldResult::Folded(scan))
         }
@@ -1042,4 +986,128 @@ fn try_fold_limit(plan: LogicalPlan, n: usize) -> Result<FoldResult> {
 /// Render before/after plans side by side.
 pub fn explain_optimized(before: &LogicalPlan, after: &LogicalPlan) -> String {
     format!("BEFORE:\n{}\nAFTER:\n{}", before.explain(), after.explain())
+}
+
+// =======================================================================
+// Rule: LimitPruning
+//
+// LimitPushdown won't fold a Limit through a Filter, and it's right not
+// to: the scan can't cap rows before the filter. But the scan can still
+// choose *which* row groups to read. For
+//
+//     Limit(k) -> (Projection | Limit)* -> Filter* -> Parquet Scan
+//
+// this rule sets `limit_hint = k` on the scan. At execute time the scan
+// reads fully-matching row groups first and, if they already hold k rows,
+// skips everything else (see ParquetScanExec::with_limit_hint).
+//
+// That's only correct if every row in a FullMatch group passes every
+// Filter in the chain, so the rule requires each Filter's predicate to be
+// covered by the scan's pushdown predicates. A conjunct the scan never
+// saw (e.g. `a < b`) blocks the hint. Projections are allowed only above
+// the Filters, so the Filters' column names are the scan's own. Nothing
+// else (Aggregate, Join, Sort...) is allowed in the chain: those change
+// which rows reach the Limit.
+// =======================================================================
+
+pub struct LimitPruning;
+
+impl OptimizerRule for LimitPruning {
+    fn name(&self) -> &str {
+        "limit_pruning"
+    }
+
+    fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        match plan {
+            LogicalPlan::Limit { input, n, .. } => {
+                let input = match hint_scan(*input, n, &mut Vec::new(), false)? {
+                    Ok(hinted) => hinted,
+                    Err(unchanged) => self.rewrite(unchanged)?,
+                };
+                Ok(LogicalPlan::limit(input, n))
+            }
+            other => map_children(other, |c| self.rewrite(c)),
+        }
+    }
+}
+
+/// Walk `(Projection | Limit)* -> Filter* -> Scan` below a Limit, collecting Filter
+/// predicates. Returns `Ok(plan with the hint set)` or `Err(plan unchanged)`
+/// when the shape or coverage check fails.
+fn hint_scan(
+    plan: LogicalPlan,
+    k: usize,
+    filters: &mut Vec<Expr>,
+    seen_filter: bool,
+) -> Result<std::result::Result<LogicalPlan, LogicalPlan>> {
+    match plan {
+        LogicalPlan::Projection { input, exprs, .. } if !seen_filter => {
+            Ok(match hint_scan(*input, k, filters, false)? {
+                Ok(inner) => Ok(LogicalPlan::project(inner, exprs)?),
+                Err(inner) => Err(LogicalPlan::project(inner, exprs)?),
+            })
+        }
+        // A nested Limit above the Filters only tightens how many rows
+        // are needed.
+        LogicalPlan::Limit { input, n, .. } if !seen_filter => {
+            Ok(match hint_scan(*input, k.min(n), filters, false)? {
+                Ok(inner) => Ok(LogicalPlan::limit(inner, n)),
+                Err(inner) => Err(LogicalPlan::limit(inner, n)),
+            })
+        }
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            filters.push(predicate.clone());
+            Ok(match hint_scan(*input, k, filters, true)? {
+                Ok(inner) => Ok(LogicalPlan::filter(inner, predicate)?),
+                Err(inner) => Err(LogicalPlan::filter(inner, predicate)?),
+            })
+        }
+        LogicalPlan::Scan {
+            source: ScanSource::Parquet { .. },
+            ref pushdown_predicates,
+            limit_hint,
+            ..
+        } => {
+            let covered = filters
+                .iter()
+                .all(|f| plume_core::predicate_covered_by(f, pushdown_predicates));
+            if !covered {
+                return Ok(Err(plan));
+            }
+            let hint = Some(limit_hint.map_or(k, |h| h.min(k)));
+            Ok(Ok(LogicalPlan::with_scan_limit_hint(plan, hint)?))
+        }
+        other => Ok(Err(other)),
+    }
+}
+
+/// Rebuild `plan` with `f` applied to each child.
+fn map_children(
+    plan: LogicalPlan,
+    mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    Ok(match plan {
+        LogicalPlan::Scan { .. } => plan,
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => LogicalPlan::filter(f(*input)?, predicate)?,
+        LogicalPlan::Projection { input, exprs, .. } => LogicalPlan::project(f(*input)?, exprs)?,
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            ..
+        } => LogicalPlan::aggregate(f(*input)?, group_exprs, agg_exprs)?,
+        LogicalPlan::Limit { input, n, .. } => LogicalPlan::limit(f(*input)?, n),
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            ..
+        } => LogicalPlan::join(f(*left)?, f(*right)?, on, filter, join_type)?,
+    })
 }

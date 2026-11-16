@@ -251,6 +251,9 @@ fn strip_pushdown(plan: LogicalPlan) -> LogicalPlan {
             projection,
             pushdown_predicates: Vec::new(),
             limit,
+            // The hint is only safe while the pushdown predicates cover
+            // the Filter above, so it has to go with them.
+            limit_hint: None,
         },
         LogicalPlan::Filter {
             input,

@@ -201,10 +201,15 @@ fn read_row_group(
     }
 
     let reader = builder.build()?;
+    let mut counted = false;
     for batch in reader {
         let result = batch.map_err(EvalError::from);
         if let Ok(b) = &result {
             metrics.add_rows_decoded(b.num_rows());
+            if !counted && b.num_rows() > 0 {
+                metrics.add_row_group_read();
+                counted = true;
+            }
         }
         if tx.send(result).is_err() {
             // Consumer disappeared (e.g. surrounding query short-circuited);
@@ -226,16 +231,25 @@ fn surviving_row_groups(
 ) -> EvalResult<Arc<Vec<usize>>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let surviving = pruning::surviving_row_groups(
+    let classes = pruning::classify_row_groups(
         builder.metadata(),
         builder.parquet_schema().root_schema(),
         predicates,
     );
+    let surviving: Vec<usize> = (0..classes.len())
+        .filter(|&i| classes[i] != pruning::RowGroupMatch::NoMatch)
+        .collect();
+    let full_match = classes
+        .iter()
+        .filter(|&&c| c == pruning::RowGroupMatch::FullMatch)
+        .count();
     metrics.reset_for_execute(
         builder.metadata(),
         builder.parquet_schema(),
         projection,
         &surviving,
+        &surviving,
+        full_match,
     );
     Ok(Arc::new(surviving))
 }

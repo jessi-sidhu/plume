@@ -105,6 +105,13 @@ pub enum LogicalPlan {
         /// at most `n` rows from the source. The Limit operator above
         /// stays in the plan to enforce the contract end-to-end.
         limit: Option<usize>,
+        /// Set by the LIMIT-pruning optimizer: the query only needs this
+        /// many rows that pass the Filters above the scan (all of which
+        /// the scan's pushdown predicates cover). Unlike `limit` this
+        /// doesn't cap rows; it lets the scan pick which row groups to
+        /// read (fully-matching ones first) and skip the rest once it has
+        /// enough. The Limit above still enforces the count.
+        limit_hint: Option<usize>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -174,6 +181,7 @@ impl LogicalPlan {
             projection: None,
             pushdown_predicates: Vec::new(),
             limit: None,
+            limit_hint: None,
         }
     }
 
@@ -184,6 +192,7 @@ impl LogicalPlan {
             projection: None,
             pushdown_predicates: Vec::new(),
             limit: None,
+            limit_hint: None,
         }
     }
 
@@ -211,6 +220,7 @@ impl LogicalPlan {
             projection: Some(cols),
             pushdown_predicates: Vec::new(),
             limit: None,
+            limit_hint: None,
         })
     }
 
@@ -223,6 +233,7 @@ impl LogicalPlan {
                 schema,
                 projection,
                 limit,
+                limit_hint,
                 ..
             } => Ok(LogicalPlan::Scan {
                 source,
@@ -230,6 +241,7 @@ impl LogicalPlan {
                 projection,
                 pushdown_predicates: predicates,
                 limit,
+                limit_hint,
             }),
             _ => Err(PlumeError::Plan(
                 "with_pushdown_predicates: target plan must be a Scan".into(),
@@ -246,6 +258,7 @@ impl LogicalPlan {
                 schema,
                 projection,
                 pushdown_predicates,
+                limit_hint,
                 ..
             } => Ok(LogicalPlan::Scan {
                 source,
@@ -253,9 +266,34 @@ impl LogicalPlan {
                 projection,
                 pushdown_predicates,
                 limit,
+                limit_hint,
             }),
             _ => Err(PlumeError::Plan(
                 "with_scan_limit: target plan must be a Scan".into(),
+            )),
+        }
+    }
+
+    /// Set (or clear) the LIMIT-pruning hint on a Scan node.
+    pub fn with_scan_limit_hint(plan: LogicalPlan, limit_hint: Option<usize>) -> Result<Self> {
+        match plan {
+            LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                pushdown_predicates,
+                limit,
+                ..
+            } => Ok(LogicalPlan::Scan {
+                source,
+                schema,
+                projection,
+                pushdown_predicates,
+                limit,
+                limit_hint,
+            }),
+            _ => Err(PlumeError::Plan(
+                "with_scan_limit_hint: target plan must be a Scan".into(),
             )),
         }
     }
@@ -513,6 +551,7 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             projection,
             pushdown_predicates,
             limit,
+            limit_hint,
         } => {
             match projection {
                 None => write!(
@@ -539,6 +578,9 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             }
             if let Some(n) = limit {
                 write!(out, ", limit={n}")?;
+            }
+            if let Some(n) = limit_hint {
+                write!(out, ", limit_hint={n}")?;
             }
             writeln!(out)?;
         }

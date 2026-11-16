@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use plume_core::{JoinType, LogicalPlan, ScanSource};
+use plume_core::{predicate_covered_by, JoinType, LogicalPlan, ScanSource};
 
 use crate::aggregate::{AggregateExec, HashAggregateExec};
 use crate::eval::EvalResult;
@@ -44,6 +44,7 @@ fn build(
             projection,
             pushdown_predicates,
             limit,
+            limit_hint,
         } => match source {
             ScanSource::Csv { path } => {
                 // CSV: pruning + pushdown don't apply; limit does (cheap to
@@ -67,6 +68,9 @@ fn build(
                 if let Some(n) = limit {
                     exec = exec.with_limit(*n);
                 }
+                if let Some(k) = limit_hint {
+                    exec = exec.with_limit_hint(*k);
+                }
                 metrics.push(exec.metrics());
                 Arc::new(exec)
             }
@@ -75,7 +79,28 @@ fn build(
             input, predicate, ..
         } => {
             let child = build(input, metrics)?;
-            Arc::new(FilterExec::new(child, predicate.clone()))
+            let mut filter = FilterExec::new(child, predicate.clone());
+            // A Filter directly on a Parquet scan can pass FullMatch batches
+            // through unevaluated, but only if the scan's pushdown
+            // predicates cover every conjunct of the filter. Otherwise a
+            // FullMatch group (judged on the pushed conjuncts alone) could
+            // still hold rows the remaining conjuncts reject.
+            if let LogicalPlan::Scan {
+                source: ScanSource::Parquet { .. },
+                pushdown_predicates,
+                ..
+            } = input.as_ref()
+            {
+                if !pushdown_predicates.is_empty()
+                    && predicate_covered_by(predicate, pushdown_predicates)
+                {
+                    // The child was the last Parquet scan built.
+                    if let Some(scan) = metrics.last() {
+                        filter = filter.with_full_match_skipping(Arc::clone(scan));
+                    }
+                }
+            }
+            Arc::new(filter)
         }
         LogicalPlan::Projection {
             input,
