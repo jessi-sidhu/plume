@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build docs/results-phase1.md and its charts from results/phase1/.
+"""Build docs/results-phase1.md and its charts from results/phase1/, and
+docs/results-phase2.md from results/phase2/ (see report_phase2.py) when
+that run exists.
 
-Every number in the generated page is read from pruning.csv or env.json.
-Nothing is typed by hand, so re-running this after a new benchmark run
-updates the whole page.
+Every number in the generated pages is read from the CSV and env.json
+files. Nothing is typed by hand, so re-running this after a new
+benchmark run updates the whole page.
 
     python3 scripts/report.py
 
@@ -371,3 +373,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    if (ROOT / "results" / "phase2" / "techniques.csv").exists():
+        import report_phase2
+
+        report_phase2.main()

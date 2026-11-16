@@ -233,6 +233,18 @@ pub fn assert_valid_sorted_result(
     key_columns: &[&str],
     all_rows: &[RecordBatch],
 ) -> Result<()> {
+    let n = assert_sort_keys_match(actual, expected, key_columns)?;
+    // Same count plus multiset containment in all_rows.
+    assert_valid_limit_result(actual, all_rows, n)
+}
+
+/// The order-sensitive half of `assert_valid_sorted_result`: same row
+/// count, and the `key_columns` identical row by row. Returns the count.
+pub fn assert_sort_keys_match(
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    key_columns: &[&str],
+) -> Result<usize> {
     fn keys(batches: &[RecordBatch], names: &[&str]) -> Result<Vec<Vec<String>>> {
         let rows = batches_to_rows(batches)?;
         let Some(first) = batches.first() else {
@@ -264,8 +276,49 @@ pub fn assert_valid_sorted_result(
             want[i]
         );
     }
-    // Same count plus multiset containment in all_rows.
-    assert_valid_limit_result(actual, all_rows, got.len())
+    Ok(got.len())
+}
+
+/// Check that every row of `actual` appears in the result of
+/// `reference_sql`, counted as a multiset, without pulling the reference
+/// out of DuckDB: `actual` is written to a temporary Parquet file and
+/// DuckDB computes `actual EXCEPT ALL reference`, which must be empty.
+/// For references too large to render (e.g. "every row of lineitem").
+/// Columns are matched by position.
+pub fn assert_rows_within(
+    conn: &Connection,
+    actual: &[RecordBatch],
+    reference_sql: &str,
+) -> Result<()> {
+    let Some(first) = actual.first() else {
+        return Ok(());
+    };
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("plume_rows_{}_{n}.parquet", std::process::id()));
+    {
+        let mut w = ArrowWriter::try_new(File::create(&path)?, first.schema(), None)?;
+        for b in actual {
+            w.write(b)?;
+        }
+        w.close()?;
+    }
+    let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 temp path"))?;
+    let extra: Result<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM (SELECT * FROM read_parquet('{p}') EXCEPT ALL ({reference_sql}))"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("containment check against `{reference_sql}`"));
+    let _ = std::fs::remove_file(&path);
+    let extra = extra?;
+    if extra != 0 {
+        bail!("{extra} returned rows are not in the result of `{reference_sql}`");
+    }
+    Ok(())
 }
 
 /// Write a single batch to a fresh Parquet file inside `dir`. Returns the
