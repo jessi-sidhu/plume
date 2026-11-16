@@ -25,6 +25,7 @@ pub struct ScanMetrics {
     rows_filter_skipped: AtomicU64,
     row_groups_pruned_limit: AtomicU64,
     row_groups_read: AtomicU64,
+    row_groups_pruned_topk: AtomicU64,
     /// Whether the batch the scan yielded most recently came from
     /// FullMatch row groups. Not a counter: it's how the scan tells a
     /// FilterExec directly above it that a batch needs no filtering. Only
@@ -45,8 +46,8 @@ pub struct ScanMetricsSnapshot {
     /// Compressed size of the projected column chunks, all row groups.
     pub bytes_total: u64,
     /// Compressed size of the projected column chunks for the row groups
-    /// the scan plans to read: the surviving ones, minus any a LIMIT hint
-    /// let it skip.
+    /// the scan reads: the surviving ones, minus any a LIMIT hint or top-k
+    /// pruning let it skip.
     pub bytes_read: u64,
     /// Surviving row groups whose stats prove every row matches the
     /// pushdown predicates.
@@ -60,6 +61,9 @@ pub struct ScanMetricsSnapshot {
     /// Row groups the reader actually decoded rows from. Lower than the
     /// surviving count when the consumer stopped early (e.g. a Limit).
     pub row_groups_read: u64,
+    /// Surviving row groups skipped because a TopK above already held k
+    /// rows strictly better than anything the group could contain.
+    pub row_groups_pruned_topk: u64,
 }
 
 impl ScanMetrics {
@@ -90,6 +94,14 @@ impl ScanMetrics {
     pub fn row_groups_read(&self) -> u64 {
         self.row_groups_read.load(Ordering::Relaxed)
     }
+    pub fn row_groups_pruned_topk(&self) -> u64 {
+        self.row_groups_pruned_topk.load(Ordering::Relaxed)
+    }
+    /// Top-k pruning skipped a surviving group of `bytes` projected bytes.
+    pub(crate) fn add_row_group_pruned_topk(&self, bytes: u64) {
+        self.row_groups_pruned_topk.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_sub(bytes, Ordering::Relaxed);
+    }
     pub(crate) fn add_row_group_read(&self) {
         self.row_groups_read.fetch_add(1, Ordering::Relaxed);
     }
@@ -116,6 +128,7 @@ impl ScanMetrics {
             rows_filter_skipped: self.rows_filter_skipped(),
             row_groups_pruned_limit: self.row_groups_pruned_limit(),
             row_groups_read: self.row_groups_read(),
+            row_groups_pruned_topk: self.row_groups_pruned_topk(),
         }
     }
 
@@ -150,6 +163,7 @@ impl ScanMetrics {
         self.row_groups_pruned_limit
             .store((surviving.len() - read.len()) as u64, Ordering::Relaxed);
         self.row_groups_read.store(0, Ordering::Relaxed);
+        self.row_groups_pruned_topk.store(0, Ordering::Relaxed);
         self.last_batch_full_match.store(false, Ordering::Relaxed);
     }
 
@@ -160,7 +174,7 @@ impl ScanMetrics {
 
 /// Sum of compressed column-chunk sizes over `row_groups`, counting only
 /// leaf columns whose top-level field is in `projection` (None = all).
-fn projected_chunk_bytes(
+pub(crate) fn projected_chunk_bytes(
     metadata: &ParquetMetaData,
     schema: &SchemaDescriptor,
     projection: Option<&[String]>,

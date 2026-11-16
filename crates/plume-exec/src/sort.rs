@@ -17,6 +17,7 @@ use plume_core::SortExpr;
 use crate::compiled::{compile, CompiledExpr};
 use crate::eval::EvalResult;
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::topk_pruning::{TopKBoundary, TopKValue};
 
 /// A sort key compiled against the input schema.
 #[derive(Clone)]
@@ -97,6 +98,9 @@ pub struct TopKExec {
     keys: Vec<Key>,
     k: usize,
     schema: SchemaRef,
+    /// Where to publish the first key of the current k-th best row, for
+    /// a scan doing top-k pruning.
+    boundary: Option<Arc<TopKBoundary>>,
 }
 
 impl TopKExec {
@@ -108,7 +112,16 @@ impl TopKExec {
             keys,
             k,
             schema,
+            boundary: None,
         }
+    }
+
+    /// Publish the k-th best first-key value to `boundary` whenever it
+    /// changes. Once the heap is full, no row whose first key is strictly
+    /// worse than this can enter it.
+    pub fn with_boundary(mut self, boundary: Arc<TopKBoundary>) -> Self {
+        self.boundary = Some(boundary);
+        self
     }
 }
 
@@ -142,7 +155,8 @@ impl TopKHeap {
         }
     }
 
-    fn insert(&mut self, batch: RecordBatch, keys: &arrow::row::Rows) -> EvalResult<()> {
+    /// Offer every row of `batch`; returns whether any was kept.
+    fn insert(&mut self, batch: RecordBatch, keys: &arrow::row::Rows) -> EvalResult<bool> {
         let idx = self.batches.len();
         let mut used = false;
         for row in 0..batch.num_rows() {
@@ -173,7 +187,16 @@ impl TopKHeap {
                 self.compact()?;
             }
         }
-        Ok(())
+        Ok(used)
+    }
+
+    /// The current k-th best row as (batch, row), once the heap is full.
+    fn kth(&self) -> Option<(&RecordBatch, usize)> {
+        if self.heap.len() < self.k {
+            return None;
+        }
+        let e = self.heap.peek()?;
+        Some((&self.batches[e.batch], e.row))
     }
 
     /// Copy the rows still in the heap into a single batch.
@@ -246,7 +269,13 @@ impl ExecutionPlan for TopKExec {
                 .map(|k| k.expr.evaluate(&batch))
                 .collect::<EvalResult<Vec<_>>>()?;
             let rows = converter.convert_columns(&cols)?;
-            heap.insert(batch, &rows)?;
+            let changed = heap.insert(batch, &rows)?;
+            if let (true, Some(boundary)) = (changed, &self.boundary) {
+                if let Some((batch, row)) = heap.kth() {
+                    let first = self.keys[0].expr.evaluate(batch)?;
+                    boundary.set(TopKValue::from_array(&first, row));
+                }
+            }
         }
         Ok(Box::new(heap.finish()?.into_iter().map(Ok)))
     }

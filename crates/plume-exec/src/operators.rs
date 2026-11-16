@@ -16,13 +16,15 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use plume_core::Expr;
 
 use crate::compiled::{compile, CompiledExpr};
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
-use crate::metrics::ScanMetrics;
+use crate::metrics::{projected_chunk_bytes, ScanMetrics};
 use crate::pruning::{classify_row_groups, RowGroupMatch};
+use crate::topk_pruning::{TopKPruning, TopKValue};
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -129,6 +131,10 @@ pub struct ParquetScanExec {
     /// stops planning reads once they cover the hint. Only set when the
     /// pushdown predicates cover that Filter (see `with_limit_hint`).
     limit_hint: Option<usize>,
+    /// Set by the planner when a TopK above sorts first by one of this
+    /// scan's columns: read groups best-first, one at a time, and skip
+    /// those the TopK's boundary rules out (see `crate::topk_pruning`).
+    top_k: Option<TopKPruning>,
     batch_size: usize,
     /// Counters for the most recent execute(); see `crate::metrics`.
     metrics: Arc<ScanMetrics>,
@@ -143,6 +149,7 @@ impl ParquetScanExec {
             pushdown_predicates: Vec::new(),
             limit: None,
             limit_hint: None,
+            top_k: None,
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -160,6 +167,7 @@ impl ParquetScanExec {
             pushdown_predicates: Vec::new(),
             limit: None,
             limit_hint: None,
+            top_k: None,
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -186,6 +194,16 @@ impl ParquetScanExec {
     /// query keeps. The LimitPruning optimizer rule checks that.
     pub fn with_limit_hint(mut self, k: usize) -> Self {
         self.limit_hint = Some(k);
+        self
+    }
+
+    /// Top-k pruning for a TopK above this scan whose first sort key is
+    /// `top_k.column`. Only correct when every node between the TopK and
+    /// this scan is a Filter or a Projection that passes the column
+    /// through unchanged; the planner checks that. Ignored when a row
+    /// limit or LIMIT hint is set.
+    pub fn with_top_k_pruning(mut self, top_k: TopKPruning) -> Self {
+        self.top_k = Some(top_k);
         self
     }
 
@@ -265,17 +283,52 @@ impl ExecutionPlan for ParquetScanExec {
         // scan uses that to skip evaluating its predicate. A row limit
         // (from LimitPushdown, which only fires with no filter) is applied
         // by a single reader so it stays global.
-        let runs: Vec<(Vec<usize>, bool)> = if self.limit.is_some() {
+        //
+        // Under top-k pruning each group is its own run, in best-first
+        // order, and carries its best possible sort value so the run can
+        // be skipped when it is reached.
+        let top_k = self.top_k_setup(&metadata, parquet_schema, &read);
+        let mut skip_info: Vec<Option<(TopKValue, u64)>> = vec![None; classes.len()];
+        let runs: Vec<(Vec<usize>, bool)> = if let Some((_, order)) = &top_k {
+            for (g, best) in order {
+                if let Some(v) = best {
+                    let bytes = projected_chunk_bytes(
+                        &metadata,
+                        parquet_schema,
+                        self.projection.as_deref(),
+                        &[*g],
+                    );
+                    skip_info[*g] = Some((v.clone(), bytes));
+                }
+            }
+            order
+                .iter()
+                .map(|(g, _)| (vec![*g], classes[*g] == RowGroupMatch::FullMatch))
+                .collect()
+        } else if self.limit.is_some() {
             vec![(read, false)]
         } else {
             group_runs(&read, |i| classes[i] == RowGroupMatch::FullMatch)
         };
+        let top_k = top_k.map(|(p, _)| p);
 
         let batch_size = self.batch_size;
         let limit = self.limit;
         let metrics = Arc::clone(&self.metrics);
         let total = classes.len();
         let stream = runs.into_iter().flat_map(move |(groups, full)| {
+            // Top-k: decided lazily, when the run is reached, so the TopK
+            // has seen every earlier group's rows.
+            if let (Some(p), [g]) = (&top_k, groups.as_slice()) {
+                if let Some((best, bytes)) = &skip_info[*g] {
+                    if p.can_skip(best) {
+                        metrics.add_row_group_pruned_topk(*bytes);
+                        let none: Box<dyn Iterator<Item = EvalResult<RecordBatch>> + Send> =
+                            Box::new(std::iter::empty());
+                        return none;
+                    }
+                }
+            }
             // Row offset where each group of this run starts, so decoded
             // rows can be mapped back to the groups actually touched.
             let mut starts = Vec::with_capacity(groups.len());
@@ -323,6 +376,36 @@ impl ExecutionPlan for ParquetScanExec {
             batches
         });
         Ok(Box::new(stream))
+    }
+}
+
+impl ParquetScanExec {
+    /// The top-k pruning config and the best-first read order of `read`,
+    /// each group with its best possible sort value (`None` = never
+    /// skippable). `None` when top-k pruning doesn't apply.
+    #[allow(clippy::type_complexity)]
+    fn top_k_setup(
+        &self,
+        metadata: &ParquetMetaData,
+        parquet_schema: &SchemaDescriptor,
+        read: &[usize],
+    ) -> Option<(TopKPruning, Vec<(usize, Option<TopKValue>)>)> {
+        let p = self.top_k.as_ref()?;
+        if self.limit.is_some() || self.limit_hint.is_some() {
+            return None;
+        }
+        let col_idx = parquet_schema
+            .root_schema()
+            .get_fields()
+            .iter()
+            .position(|f| f.name() == p.column)?;
+        let field_type = self.schema.field_with_name(&p.column).ok()?.data_type();
+        let mut order: Vec<(usize, Option<TopKValue>)> = read
+            .iter()
+            .map(|&g| (g, p.group_best(metadata.row_group(g), col_idx, field_type)))
+            .collect();
+        p.read_order(&mut order);
+        Some((p.clone(), order))
     }
 }
 

@@ -19,6 +19,7 @@ pub mod parallel;
 pub mod planner;
 mod pruning;
 pub mod sort;
+pub mod topk_pruning;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};
@@ -31,7 +32,9 @@ pub use operators::{
 };
 pub use parallel::ParallelParquetScanExec;
 pub use planner::{
-    collect, collect_with_metrics, create_physical_plan, create_physical_plan_with_metrics,
-    PlanWithMetrics,
+    collect, collect_with_metrics, collect_with_options, create_physical_plan,
+    create_physical_plan_with_metrics, create_physical_plan_with_options, PlanWithMetrics,
+    PlannerOptions,
 };
 pub use sort::{SortExec, TopKExec};
+pub use topk_pruning::{TopKBoundary, TopKPruning, TopKValue};

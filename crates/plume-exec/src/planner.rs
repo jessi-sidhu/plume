@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use plume_core::{predicate_covered_by, JoinType, LogicalPlan, ScanSource};
+use plume_core::{predicate_covered_by, Expr, JoinType, LogicalPlan, ScanSource};
 
 use crate::aggregate::{AggregateExec, HashAggregateExec};
 use crate::eval::EvalResult;
@@ -16,9 +16,26 @@ use crate::join::{CrossJoinExec, HashJoinExec};
 use crate::metrics::{ScanMetrics, ScanMetricsSnapshot};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
 use crate::sort::{SortExec, TopKExec};
+use crate::topk_pruning::{TopKBoundary, TopKPruning};
+
+/// Execution-time pruning switches. Everything is on by default; the
+/// benchmark runner and tests turn a technique off to measure it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerOptions {
+    /// Let a TopK share its boundary with the scan below it.
+    pub top_k_pruning: bool,
+}
+
+impl Default for PlannerOptions {
+    fn default() -> Self {
+        Self {
+            top_k_pruning: true,
+        }
+    }
+}
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
-    build(plan, &mut Vec::new())
+    build(plan, &mut Vec::new(), PlannerOptions::default())
 }
 
 /// A physical plan plus one metrics handle per Parquet scan in it.
@@ -29,14 +46,39 @@ pub type PlanWithMetrics = (Arc<dyn ExecutionPlan>, Vec<Arc<ScanMetrics>>);
 /// join's left input before its right). Read the handles after the plan's
 /// stream has been drained.
 pub fn create_physical_plan_with_metrics(plan: &LogicalPlan) -> EvalResult<PlanWithMetrics> {
+    create_physical_plan_with_options(plan, PlannerOptions::default())
+}
+
+/// `create_physical_plan_with_metrics` with explicit pruning switches.
+pub fn create_physical_plan_with_options(
+    plan: &LogicalPlan,
+    options: PlannerOptions,
+) -> EvalResult<PlanWithMetrics> {
     let mut metrics = Vec::new();
-    let exec = build(plan, &mut metrics)?;
+    let exec = build(plan, &mut metrics, options)?;
     Ok((exec, metrics))
 }
 
 fn build(
     plan: &LogicalPlan,
     metrics: &mut Vec<Arc<ScanMetrics>>,
+    options: PlannerOptions,
+) -> EvalResult<Arc<dyn ExecutionPlan>> {
+    build_with(plan, metrics, options, None)
+}
+
+/// `top_k` is set while walking down from a TopK whose first sort key is
+/// a plain column, through nodes that keep that column as is: Filters,
+/// and Projections that pass it through by name. Any other node clears
+/// it. A Parquet scan that receives it reads row groups best-first and
+/// skips those the TopK's boundary rules out. A Limit clears it too: the
+/// scan would no longer read in file order, which changes which rows a
+/// Limit keeps.
+fn build_with(
+    plan: &LogicalPlan,
+    metrics: &mut Vec<Arc<ScanMetrics>>,
+    options: PlannerOptions,
+    top_k: Option<TopKPruning>,
 ) -> EvalResult<Arc<dyn ExecutionPlan>> {
     Ok(match plan {
         LogicalPlan::Scan {
@@ -72,6 +114,11 @@ fn build(
                 if let Some(k) = limit_hint {
                     exec = exec.with_limit_hint(*k);
                 }
+                if let Some(t) = top_k {
+                    if schema.field_with_name(&t.column).is_ok() {
+                        exec = exec.with_top_k_pruning(t);
+                    }
+                }
                 metrics.push(exec.metrics());
                 Arc::new(exec)
             }
@@ -79,7 +126,7 @@ fn build(
         LogicalPlan::Filter {
             input, predicate, ..
         } => {
-            let child = build(input, metrics)?;
+            let child = build_with(input, metrics, options, top_k)?;
             let mut filter = FilterExec::new(child, predicate.clone());
             // A Filter directly on a Parquet scan can pass FullMatch batches
             // through unevaluated, but only if the scan's pushdown
@@ -108,30 +155,48 @@ fn build(
             exprs,
             schema,
         } => {
-            let child = build(input, metrics)?;
+            let passes = top_k.filter(|t| {
+                exprs
+                    .iter()
+                    .any(|e| matches!(e, Expr::Column(c) if *c == t.column))
+            });
+            let child = build_with(input, metrics, options, passes)?;
             Arc::new(ProjectionExec::new(child, exprs.clone(), schema.clone()))
         }
         LogicalPlan::Limit { input, n, .. } => {
-            let child = build(input, metrics)?;
+            let child = build(input, metrics, options)?;
             Arc::new(LimitExec::new(child, *n))
         }
         LogicalPlan::Sort { input, exprs, .. } => {
-            let child = build(input, metrics)?;
+            let child = build(input, metrics, options)?;
             Arc::new(SortExec::new(child, exprs))
         }
         LogicalPlan::TopK {
             input, exprs, k, ..
-        } => {
-            let child = build(input, metrics)?;
-            Arc::new(TopKExec::new(child, exprs, *k))
-        }
+        } => match &exprs[0].expr {
+            Expr::Column(column) if options.top_k_pruning => {
+                let boundary = Arc::new(TopKBoundary::default());
+                let pruning = TopKPruning {
+                    column: column.clone(),
+                    asc: exprs[0].asc,
+                    nulls_first: exprs[0].nulls_first,
+                    boundary: Arc::clone(&boundary),
+                };
+                let child = build_with(input, metrics, options, Some(pruning))?;
+                Arc::new(TopKExec::new(child, exprs, *k).with_boundary(boundary))
+            }
+            _ => {
+                let child = build(input, metrics, options)?;
+                Arc::new(TopKExec::new(child, exprs, *k))
+            }
+        },
         LogicalPlan::Aggregate {
             input,
             group_exprs,
             agg_exprs,
             schema,
         } => {
-            let child = build(input, metrics)?;
+            let child = build(input, metrics, options)?;
             if group_exprs.is_empty() {
                 Arc::new(AggregateExec::new(child, agg_exprs.clone(), schema.clone()))
             } else {
@@ -151,8 +216,8 @@ fn build(
             join_type,
             schema,
         } => {
-            let left_exec = build(left, metrics)?;
-            let right_exec = build(right, metrics)?;
+            let left_exec = build(left, metrics, options)?;
+            let right_exec = build(right, metrics, options)?;
             match join_type {
                 JoinType::Cross => Arc::new(CrossJoinExec::new(
                     left_exec,
@@ -191,7 +256,15 @@ pub fn collect(plan: &LogicalPlan) -> EvalResult<Vec<RecordBatch>> {
 pub fn collect_with_metrics(
     plan: &LogicalPlan,
 ) -> EvalResult<(Vec<RecordBatch>, Vec<ScanMetricsSnapshot>)> {
-    let (exec, metrics) = create_physical_plan_with_metrics(plan)?;
+    collect_with_options(plan, PlannerOptions::default())
+}
+
+/// `collect_with_metrics` with explicit pruning switches.
+pub fn collect_with_options(
+    plan: &LogicalPlan,
+    options: PlannerOptions,
+) -> EvalResult<(Vec<RecordBatch>, Vec<ScanMetricsSnapshot>)> {
+    let (exec, metrics) = create_physical_plan_with_options(plan, options)?;
     let batches = exec.execute()?.collect::<EvalResult<Vec<_>>>()?;
     Ok((batches, metrics.iter().map(|m| m.snapshot()).collect()))
 }
