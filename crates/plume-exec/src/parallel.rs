@@ -250,6 +250,7 @@ fn surviving_row_groups(
         &surviving,
         &surviving,
         full_match,
+        0,
     );
     Ok(Arc::new(surviving))
 }

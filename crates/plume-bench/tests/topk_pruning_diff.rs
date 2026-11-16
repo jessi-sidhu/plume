@@ -40,6 +40,7 @@ fn sales_path() -> Option<PathBuf> {
 
 const OFF: PlannerOptions = PlannerOptions {
     top_k_pruning: false,
+    join_pruning: true,
 };
 
 fn run(

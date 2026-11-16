@@ -58,6 +58,7 @@ use plume_core::{Expr, JoinType};
 
 use crate::eval::{evaluate, EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::join_pruning::{key_range, JoinFilter, JoinKeyRange};
 use crate::keys::{extract_key, key_has_null, KeyValue};
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -74,6 +75,9 @@ pub struct HashJoinExec {
     filter: Option<Expr>,
     join_type: JoinType,
     schema: SchemaRef,
+    /// (index into `on`, filter): publish the build keys' range for that
+    /// key before the probe side executes. See `crate::join_pruning`.
+    dynamic_filters: Vec<(usize, Arc<JoinFilter>)>,
 }
 
 impl HashJoinExec {
@@ -94,7 +98,17 @@ impl HashJoinExec {
             filter,
             join_type,
             schema,
+            dynamic_filters: Vec::new(),
         }
+    }
+
+    /// After building, publish the range of build key `on[i]` to each
+    /// `(i, filter)`. Only correct when the scan reading the filter is on
+    /// the probe (left) side of an Inner, Semi or Right join; the planner
+    /// checks that.
+    pub fn with_dynamic_filters(mut self, filters: Vec<(usize, Arc<JoinFilter>)>) -> Self {
+        self.dynamic_filters = filters;
+        self
     }
 }
 
@@ -151,12 +165,23 @@ impl ExecutionPlan for HashJoinExec {
         } else {
             Vec::new()
         };
-        if build_table.num_rows() > 0 {
-            let key_arrays: Vec<ArrayRef> = self
-                .on_right
+        let key_arrays: Vec<ArrayRef> = if build_table.num_rows() > 0 {
+            self.on_right
                 .iter()
                 .map(|e| evaluate(e, &build_table))
-                .collect::<EvalResult<_>>()?;
+                .collect::<EvalResult<_>>()?
+        } else {
+            Vec::new()
+        };
+        // The build side is complete: tell the probe scan which keys can
+        // possibly match, before it plans its reads.
+        for (i, f) in &self.dynamic_filters {
+            f.set(match key_arrays.get(*i) {
+                Some(a) => key_range(a),
+                None => JoinKeyRange::Empty,
+            });
+        }
+        if build_table.num_rows() > 0 {
             for row in 0..build_table.num_rows() {
                 let mut key = Vec::with_capacity(self.on_right.len());
                 for arr in &key_arrays {

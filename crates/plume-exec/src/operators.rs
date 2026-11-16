@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::csv;
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -22,9 +22,11 @@ use plume_core::Expr;
 use crate::compiled::{compile, CompiledExpr};
 use crate::eval::{EvalError, EvalResult};
 use crate::exec::{BatchStream, ExecutionPlan};
+use crate::join_pruning::JoinPruning;
 use crate::metrics::{projected_chunk_bytes, ScanMetrics};
 use crate::pruning::{classify_row_groups, RowGroupMatch};
-use crate::topk_pruning::{TopKPruning, TopKValue};
+use crate::stat_value::StatValue;
+use crate::topk_pruning::TopKPruning;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -135,6 +137,10 @@ pub struct ParquetScanExec {
     /// scan's columns: read groups best-first, one at a time, and skip
     /// those the TopK's boundary rules out (see `crate::topk_pruning`).
     top_k: Option<TopKPruning>,
+    /// Build-side key ranges from hash joins this scan is the probe side
+    /// of (see `crate::join_pruning`). Read at execute time, after the
+    /// join has drained its build side.
+    join_filters: Vec<JoinPruning>,
     batch_size: usize,
     /// Counters for the most recent execute(); see `crate::metrics`.
     metrics: Arc<ScanMetrics>,
@@ -150,6 +156,7 @@ impl ParquetScanExec {
             limit: None,
             limit_hint: None,
             top_k: None,
+            join_filters: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -168,6 +175,7 @@ impl ParquetScanExec {
             limit: None,
             limit_hint: None,
             top_k: None,
+            join_filters: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -207,6 +215,15 @@ impl ParquetScanExec {
         self
     }
 
+    /// Join pruning: skip row groups whose `p.column` stats can't overlap
+    /// the build side's keys. Only correct for a probe side whose
+    /// unmatched rows the join drops (Inner, Semi, Right), reached through
+    /// Filters and column-preserving Projections; the planner checks that.
+    pub fn with_join_pruning(mut self, p: JoinPruning) -> Self {
+        self.join_filters.push(p);
+        self
+    }
+
     /// Shared handle to this scan's metrics. Keep a clone before wrapping
     /// the scan in `Arc<dyn ExecutionPlan>`; read it after the stream is
     /// drained.
@@ -229,11 +246,13 @@ impl ExecutionPlan for ParquetScanExec {
 
         // ---- row-group classification via pushdown predicates -----------
         // With no predicates every group is FullMatch.
-        let classes = classify_row_groups(
+        let mut classes = classify_row_groups(
             &metadata,
             parquet_schema.root_schema(),
             &self.pushdown_predicates,
         );
+        // ---- join pruning: drop groups no build-side key can match ------
+        let pruned_join = self.apply_join_filters(&metadata, parquet_schema, &mut classes);
         let surviving: Vec<usize> = (0..classes.len())
             .filter(|&i| classes[i] != RowGroupMatch::NoMatch)
             .collect();
@@ -254,6 +273,7 @@ impl ExecutionPlan for ParquetScanExec {
             &surviving,
             &read,
             full_match,
+            pruned_join,
         );
 
         // ---- column projection (Week 8) ---------------------------------
@@ -288,7 +308,7 @@ impl ExecutionPlan for ParquetScanExec {
         // order, and carries its best possible sort value so the run can
         // be skipped when it is reached.
         let top_k = self.top_k_setup(&metadata, parquet_schema, &read);
-        let mut skip_info: Vec<Option<(TopKValue, u64)>> = vec![None; classes.len()];
+        let mut skip_info: Vec<Option<(StatValue, u64)>> = vec![None; classes.len()];
         let runs: Vec<(Vec<usize>, bool)> = if let Some((_, order)) = &top_k {
             for (g, best) in order {
                 if let Some(v) = best {
@@ -380,6 +400,38 @@ impl ExecutionPlan for ParquetScanExec {
 }
 
 impl ParquetScanExec {
+    /// Mark surviving groups that a join filter rules out as `NoMatch` and
+    /// return how many there were.
+    fn apply_join_filters(
+        &self,
+        metadata: &ParquetMetaData,
+        parquet_schema: &SchemaDescriptor,
+        classes: &mut [RowGroupMatch],
+    ) -> usize {
+        let fields = parquet_schema.root_schema().get_fields();
+        let filters: Vec<(&JoinPruning, usize, &DataType)> = self
+            .join_filters
+            .iter()
+            .filter_map(|p| {
+                let idx = fields.iter().position(|f| f.name() == p.column)?;
+                let ty = self.schema.field_with_name(&p.column).ok()?.data_type();
+                Some((p, idx, ty))
+            })
+            .collect();
+        let mut pruned = 0;
+        for (g, class) in classes.iter_mut().enumerate() {
+            if *class == RowGroupMatch::NoMatch {
+                continue;
+            }
+            let rg = metadata.row_group(g);
+            if filters.iter().any(|(p, idx, ty)| p.can_skip(rg, *idx, ty)) {
+                *class = RowGroupMatch::NoMatch;
+                pruned += 1;
+            }
+        }
+        pruned
+    }
+
     /// The top-k pruning config and the best-first read order of `read`,
     /// each group with its best possible sort value (`None` = never
     /// skippable). `None` when top-k pruning doesn't apply.
@@ -389,7 +441,7 @@ impl ParquetScanExec {
         metadata: &ParquetMetaData,
         parquet_schema: &SchemaDescriptor,
         read: &[usize],
-    ) -> Option<(TopKPruning, Vec<(usize, Option<TopKValue>)>)> {
+    ) -> Option<(TopKPruning, Vec<(usize, Option<StatValue>)>)> {
         let p = self.top_k.as_ref()?;
         if self.limit.is_some() || self.limit_hint.is_some() {
             return None;
@@ -400,7 +452,7 @@ impl ParquetScanExec {
             .iter()
             .position(|f| f.name() == p.column)?;
         let field_type = self.schema.field_with_name(&p.column).ok()?.data_type();
-        let mut order: Vec<(usize, Option<TopKValue>)> = read
+        let mut order: Vec<(usize, Option<StatValue>)> = read
             .iter()
             .map(|&g| (g, p.group_best(metadata.row_group(g), col_idx, field_type)))
             .collect();

@@ -28,68 +28,23 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{
-    Date32Type, Float64Type, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
-};
 use arrow_schema::DataType;
 use parquet::file::metadata::RowGroupMetaData;
-use parquet::file::statistics::Statistics;
 
-/// A sort-key value that can be compared with row-group stats. Integers,
-/// dates and microsecond timestamps all become `Int`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TopKValue {
-    Int(i64),
-    Float(f64),
-    Utf8(String),
-}
-
-impl TopKValue {
-    /// `None` when the variants differ (never happens for one column).
-    fn compare(&self, other: &TopKValue) -> Option<Ordering> {
-        match (self, other) {
-            (TopKValue::Int(a), TopKValue::Int(b)) => Some(a.cmp(b)),
-            (TopKValue::Float(a), TopKValue::Float(b)) => Some(a.total_cmp(b)),
-            (TopKValue::Utf8(a), TopKValue::Utf8(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
-            _ => None,
-        }
-    }
-
-    /// Value at `row` of `array`, or `None` for NULL or an unsupported
-    /// type.
-    pub(crate) fn from_array(array: &ArrayRef, row: usize) -> Option<TopKValue> {
-        if array.is_null(row) {
-            return None;
-        }
-        Some(match array.data_type() {
-            DataType::Int32 => TopKValue::Int(array.as_primitive::<Int32Type>().value(row) as i64),
-            DataType::Int64 => TopKValue::Int(array.as_primitive::<Int64Type>().value(row)),
-            DataType::Date32 => {
-                TopKValue::Int(array.as_primitive::<Date32Type>().value(row) as i64)
-            }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                TopKValue::Int(array.as_primitive::<TimestampMicrosecondType>().value(row))
-            }
-            DataType::Float64 => TopKValue::Float(array.as_primitive::<Float64Type>().value(row)),
-            DataType::Utf8 => TopKValue::Utf8(array.as_string::<i32>().value(row).to_string()),
-            _ => return None,
-        })
-    }
-}
+use crate::stat_value::{column_bounds, StatValue};
 
 /// The current k-th best first-key value, written by TopKExec and read by
 /// the scan. It only ever gets better.
 #[derive(Debug, Default)]
 pub struct TopKBoundary {
-    value: RwLock<Option<TopKValue>>,
+    value: RwLock<Option<StatValue>>,
 }
 
 impl TopKBoundary {
-    pub fn get(&self) -> Option<TopKValue> {
+    pub fn get(&self) -> Option<StatValue> {
         self.value.read().expect("boundary lock poisoned").clone()
     }
-    pub(crate) fn set(&self, v: Option<TopKValue>) {
+    pub(crate) fn set(&self, v: Option<StatValue>) {
         *self.value.write().expect("boundary lock poisoned") = v;
     }
 }
@@ -114,40 +69,22 @@ impl TopKPruning {
         rg: &RowGroupMetaData,
         col_idx: usize,
         field_type: &DataType,
-    ) -> Option<TopKValue> {
+    ) -> Option<StatValue> {
         let stats = rg.column(col_idx).statistics()?;
         if self.nulls_first && stats.null_count_opt() != Some(0) {
             return None;
         }
-        let asc = self.asc;
-        match (stats, field_type) {
-            (Statistics::Int32(s), DataType::Int32 | DataType::Date32) => {
-                let v = if asc { s.min_opt() } else { s.max_opt() };
-                v.map(|&x| TopKValue::Int(x as i64))
-            }
-            (
-                Statistics::Int64(s),
-                DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _),
-            ) => {
-                let v = if asc { s.min_opt() } else { s.max_opt() };
-                v.map(|&x| TopKValue::Int(x))
-            }
-            (Statistics::Double(s), DataType::Float64) => {
-                let v = if asc { s.min_opt() } else { s.max_opt() };
-                v.map(|&x| TopKValue::Float(x))
-            }
-            (Statistics::ByteArray(s), DataType::Utf8) => {
-                let v = if asc { s.min_opt() } else { s.max_opt() };
-                v.and_then(|b| std::str::from_utf8(b.data()).ok())
-                    .map(|x| TopKValue::Utf8(x.to_string()))
-            }
-            _ => None,
+        let (min, max) = column_bounds(stats, field_type)?;
+        if self.asc {
+            min
+        } else {
+            max
         }
     }
 
     /// True if a group whose best possible value is `best` can't hold a
     /// row the TopK would take, given the current boundary.
-    pub(crate) fn can_skip(&self, best: &TopKValue) -> bool {
+    pub(crate) fn can_skip(&self, best: &StatValue) -> bool {
         let Some(boundary) = self.boundary.get() else {
             return false;
         };
@@ -161,7 +98,7 @@ impl TopKPruning {
     /// Order `groups` for reading: groups that can never be skipped first
     /// (they may hold the best rows), then best possible value first.
     /// Equal values keep file order.
-    pub(crate) fn read_order(&self, groups: &mut [(usize, Option<TopKValue>)]) {
+    pub(crate) fn read_order(&self, groups: &mut [(usize, Option<StatValue>)]) {
         let asc = self.asc;
         groups.sort_by(|(ia, a), (ib, b)| {
             let by_value = match (a, b) {
@@ -186,7 +123,7 @@ impl TopKPruning {
 mod tests {
     use super::*;
 
-    fn pruning(asc: bool, boundary: Option<TopKValue>) -> TopKPruning {
+    fn pruning(asc: bool, boundary: Option<StatValue>) -> TopKPruning {
         let b = Arc::new(TopKBoundary::default());
         b.set(boundary);
         TopKPruning {
@@ -201,39 +138,39 @@ mod tests {
     fn skips_only_strictly_worse_groups() {
         // DESC with boundary 50: a group whose max is 49 can't help, a
         // group whose max is exactly 50 might tie and must be read.
-        let p = pruning(false, Some(TopKValue::Int(50)));
-        assert!(p.can_skip(&TopKValue::Int(49)));
-        assert!(!p.can_skip(&TopKValue::Int(50)));
-        assert!(!p.can_skip(&TopKValue::Int(51)));
+        let p = pruning(false, Some(StatValue::Int(50)));
+        assert!(p.can_skip(&StatValue::Int(49)));
+        assert!(!p.can_skip(&StatValue::Int(50)));
+        assert!(!p.can_skip(&StatValue::Int(51)));
         // ASC with boundary 50: min 51 is skippable, min 50 is not.
-        let p = pruning(true, Some(TopKValue::Int(50)));
-        assert!(p.can_skip(&TopKValue::Int(51)));
-        assert!(!p.can_skip(&TopKValue::Int(50)));
-        assert!(!p.can_skip(&TopKValue::Int(49)));
+        let p = pruning(true, Some(StatValue::Int(50)));
+        assert!(p.can_skip(&StatValue::Int(51)));
+        assert!(!p.can_skip(&StatValue::Int(50)));
+        assert!(!p.can_skip(&StatValue::Int(49)));
     }
 
     #[test]
     fn no_boundary_means_no_skipping() {
         let p = pruning(false, None);
-        assert!(!p.can_skip(&TopKValue::Int(i64::MIN)));
+        assert!(!p.can_skip(&StatValue::Int(i64::MIN)));
     }
 
     #[test]
     fn floats_use_total_order() {
-        let p = pruning(false, Some(TopKValue::Float(0.0)));
-        assert!(p.can_skip(&TopKValue::Float(-0.5)));
-        assert!(!p.can_skip(&TopKValue::Float(0.0)));
+        let p = pruning(false, Some(StatValue::Float(0.0)));
+        assert!(p.can_skip(&StatValue::Float(-0.5)));
+        assert!(!p.can_skip(&StatValue::Float(0.0)));
     }
 
     #[test]
     fn read_order_puts_unknown_groups_first_then_best_first() {
         let p = pruning(false, None);
         let mut g = vec![
-            (0, Some(TopKValue::Int(10))),
+            (0, Some(StatValue::Int(10))),
             (1, None),
-            (2, Some(TopKValue::Int(30))),
-            (3, Some(TopKValue::Int(30))),
-            (4, Some(TopKValue::Int(20))),
+            (2, Some(StatValue::Int(30))),
+            (3, Some(StatValue::Int(30))),
+            (4, Some(StatValue::Int(20))),
         ];
         p.read_order(&mut g);
         let order: Vec<usize> = g.iter().map(|(i, _)| *i).collect();

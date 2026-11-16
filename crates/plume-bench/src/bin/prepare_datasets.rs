@@ -15,6 +15,15 @@
 //!   - sorted:   ORDER BY l_shipdate            / tpep_pickup_datetime
 //!   - compound: ORDER BY l_shipdate, l_quantity / tpep_pickup_datetime, PULocationID
 //!
+//! `lineitem` gets a fourth layout for join pruning (Phase 2):
+//!   - orderkey: ORDER BY l_orderkey, the order dbgen generates it in, so
+//!     each row group covers a narrow range of order keys.
+//!
+//! Taxi also gets `zones.parquet`, the TLC's 265-row taxi zone lookup
+//! table, as the build side for joins on `PULocationID`. `LocationID` is
+//! cast to the type `PULocationID` has in the trip files, since Plume
+//! joins need identical key types.
+//!
 //! Every ORDER BY ends with `rowid` as a tiebreaker so the output is
 //! byte-for-byte reproducible; it only orders rows whose sort keys are equal.
 //! `orders` is the join build side, so it is written once, in dbgen order.
@@ -50,7 +59,7 @@ struct Layout {
     order_by: &'static str,
 }
 
-const LINEITEM_LAYOUTS: [Layout; 3] = [
+const LINEITEM_LAYOUTS: [Layout; 4] = [
     Layout {
         name: "random",
         order_by: "hash(rowid), rowid",
@@ -63,7 +72,13 @@ const LINEITEM_LAYOUTS: [Layout; 3] = [
         name: "compound",
         order_by: "l_shipdate, l_quantity, rowid",
     },
+    Layout {
+        name: "orderkey",
+        order_by: "l_orderkey, rowid",
+    },
 ];
+
+const TAXI_ZONES_URL: &str = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv";
 
 const TAXI_LAYOUTS: [Layout; 3] = [
     Layout {
@@ -250,14 +265,36 @@ fn prepare_taxi(conn: &Connection, data: &Path) -> Result<Value> {
 
     let (select, cast) = select_list(conn, "trips")?;
     let layouts = write_layouts(conn, "trips", &select, &TAXI_LAYOUTS, &dir, "trips")?;
+
+    // Zone lookup: the join build side for PULocationID.
+    let zones_csv = raw.join("taxi_zone_lookup.csv");
+    download(TAXI_ZONES_URL, &zones_csv)?;
+    let key_type: String = conn.query_row(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = 'trips' AND column_name = 'PULocationID'",
+        [],
+        |r| r.get(0),
+    )?;
     conn.execute_batch("DROP TABLE trips;")?;
+    let zones_path = dir.join("zones.parquet");
+    copy_to_parquet(
+        conn,
+        &format!(
+            "SELECT CAST(LocationID AS {key_type}) AS LocationID, Borough, Zone, service_zone \
+             FROM read_csv('{}', header = true) ORDER BY LocationID",
+            sql_path(&zones_csv)?
+        ),
+        &zones_path,
+    )?;
+    let zones = file_info(&zones_path)?;
+    sources.push(json!({ "url": TAXI_ZONES_URL, "raw": file_info_any(&zones_csv)? }));
 
     Ok(json!({
         "source": TAXI_SOURCE_PAGE,
         "months": TAXI_MONTHS,
         "inputs": sources,
         "decimal_columns_cast_to_double": cast,
-        "files": { "trips": layouts },
+        "files": { "trips": layouts, "zones": zones },
     }))
 }
 
@@ -355,14 +392,26 @@ fn file_info(path: &Path) -> Result<Value> {
     }))
 }
 
+/// Path (relative to the workspace) and size of any file.
+fn file_info_any(path: &Path) -> Result<Value> {
+    Ok(json!({
+        "path": path
+            .strip_prefix(workspace_root()?)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+        "bytes": fs::metadata(path)?.len(),
+    }))
+}
+
 /// Download `url` to `path` with curl unless it is already there.
 fn download(url: &str, path: &Path) -> Result<()> {
     if path.exists() {
-        println!("taxi: have {}", path.display());
+        println!("have {}", path.display());
         return Ok(());
     }
-    println!("taxi: downloading {url}");
-    let part = path.with_extension("parquet.part");
+    println!("downloading {url}");
+    let part = path.with_extension("part");
     let status = Command::new("curl")
         .args(["--fail", "--location", "--silent", "--show-error"])
         .args(["--retry", "3", "--output"])
