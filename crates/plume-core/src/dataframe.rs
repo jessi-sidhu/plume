@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use arrow_schema::SchemaRef;
 
-use crate::expr::Expr;
+use crate::expr::{Expr, SortExpr};
 use crate::plan::{JoinType, LogicalPlan};
 use crate::Result;
 
@@ -50,6 +50,14 @@ impl DataFrame {
         DataFrame {
             plan: LogicalPlan::limit(self.plan, n),
         }
+    }
+
+    /// ORDER BY `exprs`, e.g. `df.sort(vec![col("a").desc(), col("b").asc()])`.
+    /// NULLS LAST unless a key says `nulls_first()`.
+    pub fn sort(self, exprs: Vec<SortExpr>) -> Result<Self> {
+        Ok(DataFrame {
+            plan: LogicalPlan::sort(self.plan, exprs)?,
+        })
     }
 
     /// Equi-join `self` with `right` on `on` (parallel `(left_expr,

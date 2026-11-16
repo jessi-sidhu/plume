@@ -27,7 +27,9 @@ fn hints(plan: &LogicalPlan) -> Vec<Option<usize>> {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => hints(input),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::TopK { input, .. } => hints(input),
         LogicalPlan::Join { left, right, .. } => {
             let mut h = hints(left);
             h.extend(hints(right));

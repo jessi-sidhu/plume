@@ -289,6 +289,26 @@ fn strip_pushdown(plan: LogicalPlan) -> LogicalPlan {
             n,
             schema,
         },
+        LogicalPlan::Sort {
+            input,
+            exprs,
+            schema,
+        } => LogicalPlan::Sort {
+            input: Box::new(strip_pushdown(*input)),
+            exprs,
+            schema,
+        },
+        LogicalPlan::TopK {
+            input,
+            exprs,
+            k,
+            schema,
+        } => LogicalPlan::TopK {
+            input: Box::new(strip_pushdown(*input)),
+            exprs,
+            k,
+            schema,
+        },
         LogicalPlan::Join {
             left,
             right,

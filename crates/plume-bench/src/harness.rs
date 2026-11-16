@@ -216,6 +216,58 @@ pub fn assert_valid_limit_result(
     Ok(())
 }
 
+/// Check an ORDER BY result, with or without a LIMIT, against DuckDB's.
+///
+/// Rows that tie on every sort key may come back in any order, and with a
+/// LIMIT any of the rows tied at the k-th position is a valid answer. So
+/// whole rows aren't compared one to one. Instead:
+///
+/// - `actual` has as many rows as `expected` (DuckDB's ordered result),
+/// - the `key_columns`, read top to bottom, are identical in both, which
+///   proves the order and that the right sort values were kept, and
+/// - every returned row is in `all_rows` (the same query without the
+///   LIMIT; pass `expected` when there is none), counted as a multiset.
+pub fn assert_valid_sorted_result(
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    key_columns: &[&str],
+    all_rows: &[RecordBatch],
+) -> Result<()> {
+    fn keys(batches: &[RecordBatch], names: &[&str]) -> Result<Vec<Vec<String>>> {
+        let rows = batches_to_rows(batches)?;
+        let Some(first) = batches.first() else {
+            return Ok(Vec::new());
+        };
+        let schema = first.schema();
+        let idx = names
+            .iter()
+            .map(|n| {
+                schema
+                    .index_of(n)
+                    .map_err(|_| anyhow!("sort key `{n}` not in result schema"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|r| idx.iter().map(|&i| r[i].clone()).collect())
+            .collect())
+    }
+    let got = keys(actual, key_columns).context("rendering actual keys")?;
+    let want = keys(expected, key_columns).context("rendering expected keys")?;
+    if got.len() != want.len() {
+        bail!("got {} rows, DuckDB returned {}", got.len(), want.len());
+    }
+    if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
+        bail!(
+            "sort keys differ at row {i}: got {:?}, DuckDB has {:?}",
+            got[i],
+            want[i]
+        );
+    }
+    // Same count plus multiset containment in all_rows.
+    assert_valid_limit_result(actual, all_rows, got.len())
+}
+
 /// Write a single batch to a fresh Parquet file inside `dir`. Returns the
 /// path. Used by Week-3 evaluator tests that need DuckDB to see the same
 /// input the plume evaluator just consumed.

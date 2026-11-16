@@ -244,6 +244,44 @@ pub enum Expr {
     },
 }
 
+/// One ORDER BY key.
+///
+/// NULL placement defaults to NULLS LAST for both ASC and DESC (DuckDB's
+/// default too). Use `nulls_first()` to flip it per key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortExpr {
+    pub expr: Expr,
+    pub asc: bool,
+    pub nulls_first: bool,
+}
+
+impl SortExpr {
+    pub fn new(expr: Expr, asc: bool, nulls_first: bool) -> Self {
+        Self {
+            expr,
+            asc,
+            nulls_first,
+        }
+    }
+    pub fn nulls_first(mut self) -> Self {
+        self.nulls_first = true;
+        self
+    }
+    pub fn nulls_last(mut self) -> Self {
+        self.nulls_first = false;
+        self
+    }
+    /// `price DESC NULLS LAST`, as shown by `explain`.
+    pub fn display_name(&self) -> String {
+        format!(
+            "{} {} NULLS {}",
+            self.expr.display_name(),
+            if self.asc { "ASC" } else { "DESC" },
+            if self.nulls_first { "FIRST" } else { "LAST" }
+        )
+    }
+}
+
 impl Expr {
     /// Resolve this expression's output `DataType` against `input`. Returns
     /// `PlumeError::Schema` if a referenced column is missing, or
@@ -318,6 +356,14 @@ impl Expr {
     }
 
     // ---- builder-style combinators ---------------------------------------
+    /// Ascending sort key, NULLS LAST.
+    pub fn asc(self) -> SortExpr {
+        SortExpr::new(self, true, false)
+    }
+    /// Descending sort key, NULLS LAST.
+    pub fn desc(self) -> SortExpr {
+        SortExpr::new(self, false, false)
+    }
     pub fn alias(self, name: impl Into<String>) -> Expr {
         Expr::Alias {
             expr: Box::new(self),

@@ -8,6 +8,7 @@
 //!   4. ColumnPruning           — restrict scans to required columns
 //!   5. LimitPushdown           — fold a top-level Limit into the Scan
 //!   6. LimitPruning            — tell a filtered scan how many rows a Limit needs
+//!   7. SortLimitToTopK         — Limit over Sort becomes a bounded TopK
 //!
 //! Order matters. Pushdown writes predicate columns into the Scan's
 //! pushdown list; column pruning then has to keep those columns. Limit
@@ -20,7 +21,7 @@
 
 use std::collections::HashSet;
 
-use plume_core::{BinaryOperator, Expr, LogicalPlan, Result, ScalarValue, ScanSource};
+use plume_core::{BinaryOperator, Expr, LogicalPlan, Result, ScalarValue, ScanSource, SortExpr};
 
 // =======================================================================
 // Trait + driver
@@ -48,6 +49,7 @@ impl Default for Optimizer {
                 Box::new(ColumnPruning),
                 Box::new(LimitPushdown),
                 Box::new(LimitPruning),
+                Box::new(SortLimitToTopK),
             ],
             max_passes: 8,
         }
@@ -231,6 +233,22 @@ fn prune_with_required(
         } => {
             let pruned_input = prune_with_required(*input, required_from_above)?;
             Ok(LogicalPlan::limit(pruned_input, n))
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            let mut needed = required_from_above.clone();
+            for e in &exprs {
+                collect_columns(&e.expr, &mut needed);
+            }
+            LogicalPlan::sort(prune_with_required(*input, &needed)?, exprs)
+        }
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => {
+            let mut needed = required_from_above.clone();
+            for e in &exprs {
+                collect_columns(&e.expr, &mut needed);
+            }
+            LogicalPlan::top_k(prune_with_required(*input, &needed)?, exprs, k)
         }
         LogicalPlan::Join {
             left,
@@ -418,6 +436,13 @@ fn push_through(plan: LogicalPlan) -> Result<LogicalPlan> {
             let new_input = push_through(*input)?;
             Ok(LogicalPlan::limit(new_input, n))
         }
+        // A Filter above a Sort or TopK stays where it is (only a Filter
+        // directly on a scan pushes). Moving one below a TopK would change
+        // which k rows come out, so this rule never does.
+        LogicalPlan::Sort { input, exprs, .. } => LogicalPlan::sort(push_through(*input)?, exprs),
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => LogicalPlan::top_k(push_through(*input)?, exprs, k),
         LogicalPlan::Join {
             left,
             right,
@@ -746,6 +771,16 @@ fn rewrite_exprs_in_plan(plan: LogicalPlan, f: &impl Fn(Expr) -> Expr) -> Result
             let new_input = rewrite_exprs_in_plan(*input, f)?;
             LogicalPlan::limit(new_input, n)
         }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            let new_input = rewrite_exprs_in_plan(*input, f)?;
+            LogicalPlan::sort(new_input, map_sort_exprs(exprs, f))?
+        }
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => {
+            let new_input = rewrite_exprs_in_plan(*input, f)?;
+            LogicalPlan::top_k(new_input, map_sort_exprs(exprs, f), k)?
+        }
         LogicalPlan::Join {
             left,
             right,
@@ -764,6 +799,16 @@ fn rewrite_exprs_in_plan(plan: LogicalPlan, f: &impl Fn(Expr) -> Expr) -> Result
             LogicalPlan::join(new_left, new_right, new_on, new_filter, join_type)?
         }
     })
+}
+
+fn map_sort_exprs(exprs: Vec<SortExpr>, f: &impl Fn(Expr) -> Expr) -> Vec<SortExpr> {
+    exprs
+        .into_iter()
+        .map(|e| SortExpr {
+            expr: f(e.expr),
+            ..e
+        })
+        .collect()
 }
 
 // =======================================================================
@@ -812,6 +857,12 @@ impl OptimizerRule for DeadProjectionElim {
                 n,
                 schema: _,
             } => Ok(LogicalPlan::limit(self.rewrite(*input)?, n)),
+            LogicalPlan::Sort { input, exprs, .. } => {
+                LogicalPlan::sort(self.rewrite(*input)?, exprs)
+            }
+            LogicalPlan::TopK {
+                input, exprs, k, ..
+            } => LogicalPlan::top_k(self.rewrite(*input)?, exprs, k),
             LogicalPlan::Scan { .. } => Ok(plan),
             LogicalPlan::Join {
                 left,
@@ -894,6 +945,15 @@ impl OptimizerRule for LimitPushdown {
                 agg_exprs,
                 schema: _,
             } => LogicalPlan::aggregate(self.rewrite(*input)?, group_exprs, agg_exprs),
+            // A Limit never folds through a Sort or TopK (try_fold_limit
+            // stops there): the scan's first n rows aren't the sorted
+            // first n.
+            LogicalPlan::Sort { input, exprs, .. } => {
+                LogicalPlan::sort(self.rewrite(*input)?, exprs)
+            }
+            LogicalPlan::TopK {
+                input, exprs, k, ..
+            } => LogicalPlan::top_k(self.rewrite(*input)?, exprs, k),
             LogicalPlan::Scan { .. } => Ok(plan),
             LogicalPlan::Join {
                 left,
@@ -1101,6 +1161,10 @@ fn map_children(
             ..
         } => LogicalPlan::aggregate(f(*input)?, group_exprs, agg_exprs)?,
         LogicalPlan::Limit { input, n, .. } => LogicalPlan::limit(f(*input)?, n),
+        LogicalPlan::Sort { input, exprs, .. } => LogicalPlan::sort(f(*input)?, exprs)?,
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => LogicalPlan::top_k(f(*input)?, exprs, k)?,
         LogicalPlan::Join {
             left,
             right,
@@ -1110,4 +1174,54 @@ fn map_children(
             ..
         } => LogicalPlan::join(f(*left)?, f(*right)?, on, filter, join_type)?,
     })
+}
+
+// =======================================================================
+// Rule: SortLimitToTopK
+//
+//     Limit(n) -> Projection* -> Sort(keys)   =>   Projection* -> TopK(n, keys)
+//     Limit(n) -> Projection* -> TopK(k)      =>   Projection* -> TopK(min(n, k))
+//
+// A Projection maps rows one to one and keeps their order, so taking the
+// first n after it is the same as taking the first n before it. TopK
+// returns exactly min(n, input rows) rows in sort order, so the Limit
+// is dropped. Anything else between the Limit and the Sort (Filter,
+// Aggregate, Join) changes which rows exist, and blocks the rewrite.
+// =======================================================================
+
+pub struct SortLimitToTopK;
+
+impl OptimizerRule for SortLimitToTopK {
+    fn name(&self) -> &str {
+        "sort_limit_to_topk"
+    }
+
+    fn rewrite(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        match plan {
+            LogicalPlan::Limit { input, n, .. } => {
+                let input = self.rewrite(*input)?;
+                match to_top_k(input, n)? {
+                    Ok(rewritten) => Ok(rewritten),
+                    Err(unchanged) => Ok(LogicalPlan::limit(unchanged, n)),
+                }
+            }
+            other => map_children(other, |c| self.rewrite(c)),
+        }
+    }
+}
+
+/// `Ok(rewritten)` when `plan` is `Projection* -> Sort | TopK`, else
+/// `Err(plan unchanged)`.
+fn to_top_k(plan: LogicalPlan, n: usize) -> Result<std::result::Result<LogicalPlan, LogicalPlan>> {
+    match plan {
+        LogicalPlan::Sort { input, exprs, .. } => Ok(Ok(LogicalPlan::top_k(*input, exprs, n)?)),
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => Ok(Ok(LogicalPlan::top_k(*input, exprs, k.min(n))?)),
+        LogicalPlan::Projection { input, exprs, .. } => Ok(match to_top_k(*input, n)? {
+            Ok(inner) => Ok(LogicalPlan::project(inner, exprs)?),
+            Err(inner) => Err(LogicalPlan::project(inner, exprs)?),
+        }),
+        other => Ok(Err(other)),
+    }
 }

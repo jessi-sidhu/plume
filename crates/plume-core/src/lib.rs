@@ -26,6 +26,6 @@ pub use dataframe::DataFrame;
 pub use expr::{
     avg, col, conjuncts, count, count_star, lit, lit_date, lit_timestamp, max, min,
     normalize_pushable, predicate_covered_by, sum, AggregateFunction, BinaryOperator, Expr,
-    ScalarValue,
+    ScalarValue, SortExpr,
 };
 pub use plan::{JoinType, LogicalPlan, ScanSource};
