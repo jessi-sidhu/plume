@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::expr::{fields_for, Expr};
+use crate::expr::{fields_for, Expr, SortExpr};
 use crate::{PlumeError, Result};
 
 /// Equi-join semantics. Cross is the no-keys nested-loop case; Semi/Anti
@@ -135,6 +135,22 @@ pub enum LogicalPlan {
         n: usize,
         schema: SchemaRef,
     },
+    /// Full sort of the input by `exprs` (first key most significant).
+    Sort {
+        input: Box<LogicalPlan>,
+        exprs: Vec<SortExpr>,
+        schema: SchemaRef,
+    },
+    /// The first `k` rows of the input in `exprs` order: `Limit(k)` over
+    /// `Sort`, rewritten by the optimizer so execution only keeps k rows.
+    /// With ties at the k-th position any of the tied rows may be
+    /// returned.
+    TopK {
+        input: Box<LogicalPlan>,
+        exprs: Vec<SortExpr>,
+        k: usize,
+        schema: SchemaRef,
+    },
     /// Equi-join (or Cross when `on` is empty). The first multi-input plan
     /// node in the engine. Schema is computed at construction time and
     /// cached: it concatenates left then right with collision-suffixing
@@ -168,6 +184,8 @@ impl LogicalPlan {
             | LogicalPlan::Projection { schema, .. }
             | LogicalPlan::Aggregate { schema, .. }
             | LogicalPlan::Limit { schema, .. }
+            | LogicalPlan::Sort { schema, .. }
+            | LogicalPlan::TopK { schema, .. }
             | LogicalPlan::Join { schema, .. } => schema.clone(),
         }
     }
@@ -376,6 +394,28 @@ impl LogicalPlan {
         }
     }
 
+    /// Sort by `exprs`. Each key must resolve against the input schema and
+    /// must not be an aggregate. Output schema is the input's.
+    pub fn sort(input: LogicalPlan, exprs: Vec<SortExpr>) -> Result<Self> {
+        check_sort_exprs(&input, &exprs)?;
+        Ok(LogicalPlan::Sort {
+            schema: input.schema(),
+            input: Box::new(input),
+            exprs,
+        })
+    }
+
+    /// First `k` rows in `exprs` order. Same key rules as `sort`.
+    pub fn top_k(input: LogicalPlan, exprs: Vec<SortExpr>, k: usize) -> Result<Self> {
+        check_sort_exprs(&input, &exprs)?;
+        Ok(LogicalPlan::TopK {
+            schema: input.schema(),
+            input: Box::new(input),
+            exprs,
+            k,
+        })
+    }
+
     /// Construct a Join plan node. Validates each `(l, r)` key pair against
     /// the corresponding input schema and computes the output schema with
     /// collision suffixing + nullability widening. `Cross` requires `on` to
@@ -471,6 +511,23 @@ impl LogicalPlan {
         write_indented(self, &mut s, 0).expect("write to String never fails");
         s
     }
+}
+
+fn check_sort_exprs(input: &LogicalPlan, exprs: &[SortExpr]) -> Result<()> {
+    if exprs.is_empty() {
+        return Err(PlumeError::Plan("sort requires at least one key".into()));
+    }
+    let schema = input.schema();
+    for s in exprs {
+        if is_aggregate_expr(&s.expr) {
+            return Err(PlumeError::Plan(format!(
+                "sort key `{}` is an aggregate; aggregate first, then sort",
+                s.expr.display_name()
+            )));
+        }
+        s.expr.data_type(&schema)?;
+    }
+    Ok(())
 }
 
 fn is_aggregate_expr(e: &Expr) -> bool {
@@ -615,6 +672,16 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
             writeln!(out, "{pad}Limit: {n}")?;
             write_indented(input, out, depth + 1)?;
         }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            writeln!(out, "{pad}Sort: [{}]", sort_names(exprs))?;
+            write_indented(input, out, depth + 1)?;
+        }
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => {
+            writeln!(out, "{pad}TopK: k={k} [{}]", sort_names(exprs))?;
+            write_indented(input, out, depth + 1)?;
+        }
         LogicalPlan::Join {
             left,
             right,
@@ -651,6 +718,14 @@ fn write_indented(plan: &LogicalPlan, out: &mut String, depth: usize) -> fmt::Re
         }
     }
     Ok(())
+}
+
+fn sort_names(exprs: &[SortExpr]) -> String {
+    exprs
+        .iter()
+        .map(|e| e.display_name())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl fmt::Display for LogicalPlan {

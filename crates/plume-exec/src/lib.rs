@@ -4,6 +4,7 @@
 //! - `exec`: `ExecutionPlan` trait + batch stream (Week 4).
 //! - `operators`: CsvScan, Memory, Filter, Projection, Limit (Week 4).
 //! - `aggregate`: Accumulator + global AggregateExec (Week 5).
+//! - `sort`: SortExec (full sort) and TopKExec (bounded heap).
 //! - `planner`: LogicalPlan → ExecutionPlan + `collect()` (Week 4+).
 
 pub mod aggregate;
@@ -17,6 +18,7 @@ pub mod operators;
 pub mod parallel;
 pub mod planner;
 mod pruning;
+pub mod sort;
 
 pub use aggregate::{Accumulator, AggregateExec, HashAggregateExec};
 pub use compiled::{compile, CompiledExpr};
@@ -32,3 +34,4 @@ pub use planner::{
     collect, collect_with_metrics, create_physical_plan, create_physical_plan_with_metrics,
     PlanWithMetrics,
 };
+pub use sort::{SortExec, TopKExec};

@@ -26,7 +26,9 @@ fn scan_projection(plan: &LogicalPlan) -> Option<Vec<String>> {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => scan_projection(input),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::TopK { input, .. } => scan_projection(input),
         LogicalPlan::Join { left, .. } => scan_projection(left),
     }
 }

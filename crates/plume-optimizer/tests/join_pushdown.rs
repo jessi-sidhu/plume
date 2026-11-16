@@ -50,7 +50,9 @@ fn filter_predicates(plan: &LogicalPlan) -> Vec<String> {
             }
             LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Limit { input, .. } => walk(input, out),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopK { input, .. } => walk(input, out),
             LogicalPlan::Join { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
@@ -480,7 +482,9 @@ fn filter_predicates_above_join(plan: &LogicalPlan) -> Vec<String> {
             }
             LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Limit { input, .. } => walk(input, out),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopK { input, .. } => walk(input, out),
             LogicalPlan::Join { .. } => {}
             LogicalPlan::Scan { .. } => {}
         }
@@ -496,7 +500,9 @@ fn left_subtree(plan: &LogicalPlan) -> &LogicalPlan {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Limit { input, .. } => find_join(input),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopK { input, .. } => find_join(input),
             LogicalPlan::Scan { .. } => panic!("no Join in plan"),
         }
     }
@@ -513,7 +519,9 @@ fn right_subtree(plan: &LogicalPlan) -> &LogicalPlan {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Limit { input, .. } => find_join(input),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopK { input, .. } => find_join(input),
             LogicalPlan::Scan { .. } => panic!("no Join in plan"),
         }
     }
@@ -536,7 +544,9 @@ fn contains_filter(plan: &LogicalPlan, predicate_text: &str) -> bool {
         }
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => contains_filter(input, predicate_text),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::TopK { input, .. } => contains_filter(input, predicate_text),
         LogicalPlan::Join { left, right, .. } => {
             contains_filter(left, predicate_text) || contains_filter(right, predicate_text)
         }
@@ -556,7 +566,9 @@ fn find_scan_by_path<'a>(plan: &'a LogicalPlan, suffix: &str) -> Option<&'a Logi
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => find_scan_by_path(input, suffix),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::TopK { input, .. } => find_scan_by_path(input, suffix),
         LogicalPlan::Join { left, right, .. } => {
             find_scan_by_path(left, suffix).or_else(|| find_scan_by_path(right, suffix))
         }

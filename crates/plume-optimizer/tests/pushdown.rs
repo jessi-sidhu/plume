@@ -30,7 +30,9 @@ fn scan_pushdowns(plan: &LogicalPlan) -> Option<Vec<String>> {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => scan_pushdowns(input),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::TopK { input, .. } => scan_pushdowns(input),
         LogicalPlan::Join { left, .. } => scan_pushdowns(left),
     }
 }
@@ -180,7 +182,9 @@ fn optimize_runs_pushdown_then_pruning_in_one_call() {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Limit { input, .. } => scan_proj(input),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopK { input, .. } => scan_proj(input),
             LogicalPlan::Join { left, .. } => scan_proj(left),
         }
     }

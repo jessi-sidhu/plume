@@ -15,6 +15,7 @@ use crate::exec::ExecutionPlan;
 use crate::join::{CrossJoinExec, HashJoinExec};
 use crate::metrics::{ScanMetrics, ScanMetricsSnapshot};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
+use crate::sort::{SortExec, TopKExec};
 
 pub fn create_physical_plan(plan: &LogicalPlan) -> EvalResult<Arc<dyn ExecutionPlan>> {
     build(plan, &mut Vec::new())
@@ -113,6 +114,16 @@ fn build(
         LogicalPlan::Limit { input, n, .. } => {
             let child = build(input, metrics)?;
             Arc::new(LimitExec::new(child, *n))
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            let child = build(input, metrics)?;
+            Arc::new(SortExec::new(child, exprs))
+        }
+        LogicalPlan::TopK {
+            input, exprs, k, ..
+        } => {
+            let child = build(input, metrics)?;
+            Arc::new(TopKExec::new(child, exprs, *k))
         }
         LogicalPlan::Aggregate {
             input,
