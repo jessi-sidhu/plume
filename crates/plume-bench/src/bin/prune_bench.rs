@@ -182,6 +182,9 @@ fn phase2(args: &Args) -> Result<()> {
     let out_dir = root.join("results").join("phase2");
     fs::create_dir_all(&out_dir)?;
 
+    // Recorded before the run starts, so the commit and dirty flag
+    // describe the code that was measured.
+    let env = env_info(args)?;
     let mut csv = String::from(PHASE2_HEADER);
     csv.push('\n');
     for &dataset in &args.datasets {
@@ -214,10 +217,7 @@ fn phase2(args: &Args) -> Result<()> {
     let csv_path = out_dir.join("techniques.csv");
     fs::write(&csv_path, csv)?;
     let env_path = out_dir.join("env.json");
-    fs::write(
-        &env_path,
-        serde_json::to_string_pretty(&env_info(args)?)? + "\n",
-    )?;
+    fs::write(&env_path, serde_json::to_string_pretty(&env)? + "\n")?;
     println!("wrote {} and {}", csv_path.display(), env_path.display());
     Ok(())
 }
