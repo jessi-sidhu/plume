@@ -201,10 +201,15 @@ fn read_row_group(
     }
 
     let reader = builder.build()?;
+    let mut counted = false;
     for batch in reader {
         let result = batch.map_err(EvalError::from);
         if let Ok(b) = &result {
             metrics.add_rows_decoded(b.num_rows());
+            if !counted && b.num_rows() > 0 {
+                metrics.add_row_group_read();
+                counted = true;
+            }
         }
         if tx.send(result).is_err() {
             // Consumer disappeared (e.g. surrounding query short-circuited);
@@ -242,6 +247,7 @@ fn surviving_row_groups(
         builder.metadata(),
         builder.parquet_schema(),
         projection,
+        &surviving,
         &surviving,
         full_match,
     );

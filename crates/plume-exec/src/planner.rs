@@ -44,6 +44,7 @@ fn build(
             projection,
             pushdown_predicates,
             limit,
+            limit_hint,
         } => match source {
             ScanSource::Csv { path } => {
                 // CSV: pruning + pushdown don't apply; limit does (cheap to
@@ -66,6 +67,9 @@ fn build(
                 }
                 if let Some(n) = limit {
                     exec = exec.with_limit(*n);
+                }
+                if let Some(k) = limit_hint {
+                    exec = exec.with_limit_hint(*k);
                 }
                 metrics.push(exec.metrics());
                 Arc::new(exec)

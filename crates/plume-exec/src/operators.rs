@@ -15,6 +15,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use parquet::arrow::ProjectionMask;
+use parquet::file::metadata::ParquetMetaData;
 use plume_core::Expr;
 
 use crate::compiled::{compile, CompiledExpr};
@@ -123,6 +124,11 @@ pub struct ParquetScanExec {
     /// Optional row-count cap from the limit-pushdown optimizer. When set,
     /// the scan tells the parquet reader to stop after `limit` rows.
     limit: Option<usize>,
+    /// From the LIMIT-pruning optimizer: only this many rows passing the
+    /// Filter above are needed. The scan reads FullMatch groups first and
+    /// stops planning reads once they cover the hint. Only set when the
+    /// pushdown predicates cover that Filter (see `with_limit_hint`).
+    limit_hint: Option<usize>,
     batch_size: usize,
     /// Counters for the most recent execute(); see `crate::metrics`.
     metrics: Arc<ScanMetrics>,
@@ -136,6 +142,7 @@ impl ParquetScanExec {
             projection: None,
             pushdown_predicates: Vec::new(),
             limit: None,
+            limit_hint: None,
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -152,6 +159,7 @@ impl ParquetScanExec {
             projection: Some(projected_columns),
             pushdown_predicates: Vec::new(),
             limit: None,
+            limit_hint: None,
             batch_size: DEFAULT_BATCH_SIZE,
             metrics: Arc::default(),
         }
@@ -164,6 +172,20 @@ impl ParquetScanExec {
 
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// LIMIT pruning: the consumer needs only `k` rows that pass the
+    /// pushdown predicates. The scan reads FullMatch groups first; if they
+    /// hold at least `k` rows it reads just enough of them and skips every
+    /// other group, otherwise it reads all FullMatch groups and then the
+    /// PartialMatch ones.
+    ///
+    /// Only correct when every Filter between this scan and the Limit is
+    /// covered by the pushdown predicates, so FullMatch rows are rows the
+    /// query keeps. The LimitPruning optimizer rule checks that.
+    pub fn with_limit_hint(mut self, k: usize) -> Self {
+        self.limit_hint = Some(k);
         self
     }
 
@@ -201,11 +223,18 @@ impl ExecutionPlan for ParquetScanExec {
             .iter()
             .filter(|&&i| classes[i] == RowGroupMatch::FullMatch)
             .count();
+
+        // ---- LIMIT pruning: which surviving groups to read, in order ----
+        let read = match (self.limit_hint, self.limit) {
+            (Some(k), None) => limit_read_order(&classes, &metadata, k),
+            _ => surviving.clone(),
+        };
         self.metrics.reset_for_execute(
             &metadata,
             parquet_schema,
             self.projection.as_deref(),
             &surviving,
+            &read,
             full_match,
         );
 
@@ -237,9 +266,9 @@ impl ExecutionPlan for ParquetScanExec {
         // (from LimitPushdown, which only fires with no filter) is applied
         // by a single reader so it stays global.
         let runs: Vec<(Vec<usize>, bool)> = if self.limit.is_some() {
-            vec![(surviving, false)]
+            vec![(read, false)]
         } else {
-            group_runs(&surviving, |i| classes[i] == RowGroupMatch::FullMatch)
+            group_runs(&read, |i| classes[i] == RowGroupMatch::FullMatch)
         };
 
         let batch_size = self.batch_size;
@@ -247,6 +276,14 @@ impl ExecutionPlan for ParquetScanExec {
         let metrics = Arc::clone(&self.metrics);
         let total = classes.len();
         let stream = runs.into_iter().flat_map(move |(groups, full)| {
+            // Row offset where each group of this run starts, so decoded
+            // rows can be mapped back to the groups actually touched.
+            let mut starts = Vec::with_capacity(groups.len());
+            let mut offset = 0u64;
+            for &g in &groups {
+                starts.push(offset);
+                offset += metadata.row_group(g).num_rows().max(0) as u64;
+            }
             let reader = (|| -> EvalResult<_> {
                 let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
                     file.try_clone()?,
@@ -267,10 +304,17 @@ impl ExecutionPlan for ParquetScanExec {
                 Ok(builder.build()?)
             })();
             let metrics = Arc::clone(&metrics);
+            let mut decoded = 0u64;
+            let mut touched = 0usize;
             let batches: Box<dyn Iterator<Item = EvalResult<RecordBatch>> + Send> = match reader {
                 Ok(r) => Box::new(r.map(move |b| {
                     let batch = b.map_err(EvalError::from)?;
                     metrics.add_rows_decoded(batch.num_rows());
+                    decoded += batch.num_rows() as u64;
+                    while touched < starts.len() && starts[touched] < decoded {
+                        touched += 1;
+                        metrics.add_row_group_read();
+                    }
                     metrics.set_last_batch_full_match(full);
                     Ok(batch)
                 })),
@@ -279,6 +323,33 @@ impl ExecutionPlan for ParquetScanExec {
             batches
         });
         Ok(Box::new(stream))
+    }
+}
+
+/// Row groups to read under a LIMIT hint of `k` rows, in read order.
+/// FullMatch groups come first, in file order. If they hold at least `k`
+/// rows, just enough of them to reach `k` are read and nothing else.
+/// Otherwise every FullMatch group is read, then every PartialMatch one.
+fn limit_read_order(classes: &[RowGroupMatch], metadata: &ParquetMetaData, k: usize) -> Vec<usize> {
+    let of = |want: RowGroupMatch| (0..classes.len()).filter(move |&i| classes[i] == want);
+    let full: Vec<usize> = of(RowGroupMatch::FullMatch).collect();
+    let full_rows: u64 = full
+        .iter()
+        .map(|&i| metadata.row_group(i).num_rows().max(0) as u64)
+        .sum();
+    if full_rows >= k as u64 {
+        let mut covered = 0u64;
+        full.into_iter()
+            .take_while(|&i| {
+                let need = covered < k as u64;
+                covered += metadata.row_group(i).num_rows().max(0) as u64;
+                need
+            })
+            .collect()
+    } else {
+        full.into_iter()
+            .chain(of(RowGroupMatch::PartialMatch))
+            .collect()
     }
 }
 

@@ -23,6 +23,8 @@ pub struct ScanMetrics {
     bytes_read: AtomicU64,
     row_groups_full_match: AtomicU64,
     rows_filter_skipped: AtomicU64,
+    row_groups_pruned_limit: AtomicU64,
+    row_groups_read: AtomicU64,
     /// Whether the batch the scan yielded most recently came from
     /// FullMatch row groups. Not a counter: it's how the scan tells a
     /// FilterExec directly above it that a batch needs no filtering. Only
@@ -42,8 +44,9 @@ pub struct ScanMetricsSnapshot {
     pub rows_decoded: u64,
     /// Compressed size of the projected column chunks, all row groups.
     pub bytes_total: u64,
-    /// Compressed size of the projected column chunks, surviving row
-    /// groups only.
+    /// Compressed size of the projected column chunks for the row groups
+    /// the scan plans to read: the surviving ones, minus any a LIMIT hint
+    /// let it skip.
     pub bytes_read: u64,
     /// Surviving row groups whose stats prove every row matches the
     /// pushdown predicates.
@@ -51,6 +54,12 @@ pub struct ScanMetricsSnapshot {
     /// Rows a FilterExec passed through without evaluating its predicate,
     /// because they came from FullMatch row groups.
     pub rows_filter_skipped: u64,
+    /// Surviving row groups the scan didn't plan to read because a LIMIT
+    /// hint was already covered by FullMatch groups.
+    pub row_groups_pruned_limit: u64,
+    /// Row groups the reader actually decoded rows from. Lower than the
+    /// surviving count when the consumer stopped early (e.g. a Limit).
+    pub row_groups_read: u64,
 }
 
 impl ScanMetrics {
@@ -75,6 +84,15 @@ impl ScanMetrics {
     pub fn rows_filter_skipped(&self) -> u64 {
         self.rows_filter_skipped.load(Ordering::Relaxed)
     }
+    pub fn row_groups_pruned_limit(&self) -> u64 {
+        self.row_groups_pruned_limit.load(Ordering::Relaxed)
+    }
+    pub fn row_groups_read(&self) -> u64 {
+        self.row_groups_read.load(Ordering::Relaxed)
+    }
+    pub(crate) fn add_row_group_read(&self) {
+        self.row_groups_read.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub(crate) fn set_last_batch_full_match(&self, full: bool) {
         self.last_batch_full_match.store(full, Ordering::Relaxed);
@@ -96,6 +114,8 @@ impl ScanMetrics {
             bytes_read: self.bytes_read(),
             row_groups_full_match: self.row_groups_full_match(),
             rows_filter_skipped: self.rows_filter_skipped(),
+            row_groups_pruned_limit: self.row_groups_pruned_limit(),
+            row_groups_read: self.row_groups_read(),
         }
     }
 
@@ -107,6 +127,7 @@ impl ScanMetrics {
         schema: &SchemaDescriptor,
         projection: Option<&[String]>,
         surviving: &[usize],
+        read: &[usize],
         full_match: usize,
     ) {
         let total = metadata.num_row_groups();
@@ -119,13 +140,16 @@ impl ScanMetrics {
             Ordering::Relaxed,
         );
         self.bytes_read.store(
-            projected_chunk_bytes(metadata, schema, projection, surviving),
+            projected_chunk_bytes(metadata, schema, projection, read),
             Ordering::Relaxed,
         );
         self.rows_decoded.store(0, Ordering::Relaxed);
         self.row_groups_full_match
             .store(full_match as u64, Ordering::Relaxed);
         self.rows_filter_skipped.store(0, Ordering::Relaxed);
+        self.row_groups_pruned_limit
+            .store((surviving.len() - read.len()) as u64, Ordering::Relaxed);
+        self.row_groups_read.store(0, Ordering::Relaxed);
         self.last_batch_full_match.store(false, Ordering::Relaxed);
     }
 
