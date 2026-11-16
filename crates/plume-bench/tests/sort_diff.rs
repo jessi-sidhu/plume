@@ -210,10 +210,13 @@ fn sort_after_filter_and_on_empty_input() -> Result<()> {
     let p = write_input(dir.path());
     check(
         &p,
+        // Not `bucket = 2`: DuckDB 1.2.2's debug build trips an internal
+        // assertion (compress_integral.cpp, `min_val <= input`) on that
+        // query, though its result is right. Same shape, other predicate.
         scan(&p)
-            .filter(col("bucket").eq(lit(2i64)))?
+            .filter(col("s").eq(lit("oak")))?
             .sort(vec![col("d").asc(), col("id").asc()])?,
-        "SELECT * FROM t WHERE bucket = 2 ORDER BY d, id",
+        "SELECT * FROM t WHERE s = 'oak' ORDER BY d, id",
         None,
         &["d", "id"],
     )?;
