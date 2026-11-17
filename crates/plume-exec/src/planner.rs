@@ -13,7 +13,7 @@ use crate::aggregate::{AggregateExec, HashAggregateExec};
 use crate::eval::EvalResult;
 use crate::exec::ExecutionPlan;
 use crate::join::{CrossJoinExec, HashJoinExec};
-use crate::join_pruning::{JoinFilter, JoinPruning};
+use crate::join_pruning::{JoinFilter, JoinPruning, JOIN_KEY_SET_MAX};
 use crate::metrics::{ScanMetrics, ScanMetricsSnapshot};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
 use crate::sort::{SortExec, TopKExec};
@@ -27,6 +27,12 @@ pub struct PlannerOptions {
     pub top_k_pruning: bool,
     /// Let a hash join send its build-side key ranges to the probe scan.
     pub join_pruning: bool,
+    /// With join pruning, send small build sides (up to
+    /// `JOIN_KEY_SET_MAX` distinct keys) as exact key sets, not min/max.
+    pub join_key_set: bool,
+    /// With top-k pruning, set the boundary from row-group stats before
+    /// reading anything, when that is safe (§5.4).
+    pub top_k_stats_init: bool,
 }
 
 impl Default for PlannerOptions {
@@ -34,6 +40,8 @@ impl Default for PlannerOptions {
         Self {
             top_k_pruning: true,
             join_pruning: true,
+            join_key_set: true,
+            top_k_stats_init: true,
         }
     }
 }
@@ -51,15 +59,34 @@ impl Default for PlannerOptions {
 struct Down {
     top_k: Option<TopKPruning>,
     join: Vec<JoinPruning>,
+    /// Predicates of the Filters passed on the way down from a TopK. Stats
+    /// initialization needs every one covered by the scan's pushdown
+    /// predicates, so FullMatch rows are rows that reach the TopK.
+    top_k_filters: Vec<Expr>,
 }
 
 impl Down {
     fn through_projection(self, exprs: &[Expr]) -> Down {
         let keeps = |c: &str| exprs.iter().any(|e| matches!(e, Expr::Column(n) if n == c));
+        // Coverage compares predicates by column name, which is only
+        // meaningful if names below the projection mean the same thing:
+        // every expression must be a plain column.
+        let plain = exprs.iter().all(|e| matches!(e, Expr::Column(_)));
         Down {
-            top_k: self.top_k.filter(|t| keeps(&t.column)),
+            top_k: self.top_k.filter(|t| keeps(&t.column)).map(|mut t| {
+                t.init_from_stats &= plain;
+                t
+            }),
             join: self.join.into_iter().filter(|j| keeps(&j.column)).collect(),
+            top_k_filters: self.top_k_filters,
         }
+    }
+
+    fn through_filter(mut self, predicate: &Expr) -> Down {
+        if self.top_k.is_some() {
+            self.top_k_filters.push(predicate.clone());
+        }
+        self
     }
 }
 
@@ -137,7 +164,11 @@ fn build_with(
                 if let Some(k) = limit_hint {
                     exec = exec.with_limit_hint(*k);
                 }
-                if let Some(t) = down.top_k {
+                if let Some(mut t) = down.top_k {
+                    t.init_from_stats &= down
+                        .top_k_filters
+                        .iter()
+                        .all(|f| predicate_covered_by(f, pushdown_predicates));
                     if schema.field_with_name(&t.column).is_ok() {
                         exec = exec.with_top_k_pruning(t);
                     }
@@ -154,7 +185,7 @@ fn build_with(
         LogicalPlan::Filter {
             input, predicate, ..
         } => {
-            let child = build_with(input, metrics, options, down)?;
+            let child = build_with(input, metrics, options, down.through_filter(predicate))?;
             let mut filter = FilterExec::new(child, predicate.clone());
             // A Filter directly on a Parquet scan can pass FullMatch batches
             // through unevaluated, but only if the scan's pushdown
@@ -204,10 +235,12 @@ fn build_with(
                     asc: exprs[0].asc,
                     nulls_first: exprs[0].nulls_first,
                     boundary: Arc::clone(&boundary),
+                    k: *k,
+                    init_from_stats: options.top_k_stats_init,
                 };
                 let down = Down {
                     top_k: Some(pruning),
-                    join: Vec::new(),
+                    ..Down::default()
                 };
                 let child = build_with(input, metrics, options, down)?;
                 Arc::new(TopKExec::new(child, exprs, *k).with_boundary(boundary))
@@ -288,7 +321,12 @@ fn build_with(
                         *join_type,
                         schema.clone(),
                     )
-                    .with_dynamic_filters(dynamic_filters),
+                    .with_dynamic_filters(dynamic_filters)
+                    .with_key_set_max(if options.join_key_set {
+                        JOIN_KEY_SET_MAX
+                    } else {
+                        0
+                    }),
                 ),
             }
         }

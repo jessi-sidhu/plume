@@ -20,7 +20,19 @@
 //! - Missing stats or an unsupported type: never skipped.
 //!
 //! A NULL boundary (the k-th row's key is NULL) publishes nothing, so
-//! nothing is skipped. Floats compare with `total_cmp`, like Arrow's sort.
+//! nothing is skipped.
+//!
+//! Stats initialization (§5.4): before reading anything, the scan can
+//! set a boundary from FullMatch groups, whose rows are all known to
+//! reach the TopK. For DESC, a FullMatch group with n non-NULL sort
+//! values and min stat m guarantees n rows with key >= m. Taking groups
+//! by min, best first, until their non-NULL rows add up to k gives a
+//! value b with at least k rows >= b, so the true k-th best is >= b and
+//! b is a safe boundary (ASC mirrors this with max). It's only used when
+//! every Filter between the TopK and the scan is covered by the scan's
+//! pushdown predicates, and not under NULLS FIRST. Once set, TopK only
+//! ever tightens the boundary, so a heap that is still filling with
+//! worse rows can't loosen it. Floats compare with `total_cmp`, like Arrow's sort.
 //! As with filter pruning, this assumes float data has no NaN: Parquet
 //! leaves NaN out of min/max, so a DESC query over a group holding NaN
 //! (which sorts above every number) would be pruned wrongly.
@@ -29,7 +41,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, RwLock};
 
 use arrow_schema::DataType;
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 
 use crate::stat_value::{column_bounds, StatValue};
 
@@ -47,6 +59,28 @@ impl TopKBoundary {
     pub(crate) fn set(&self, v: Option<StatValue>) {
         *self.value.write().expect("boundary lock poisoned") = v;
     }
+
+    /// Replace the boundary with `v` only if `v` is better. Under NULLS
+    /// FIRST, where no stats boundary is ever set and the k-th value can
+    /// legitimately become NULL, this is a plain `set`.
+    pub(crate) fn tighten(&self, v: Option<StatValue>, asc: bool, nulls_first: bool) {
+        if nulls_first {
+            return self.set(v);
+        }
+        let mut cur = self.value.write().expect("boundary lock poisoned");
+        let better = match (&*cur, &v) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(c), Some(n)) => match n.compare(c) {
+                Some(Ordering::Less) => asc,
+                Some(Ordering::Greater) => !asc,
+                _ => false,
+            },
+        };
+        if better {
+            *cur = v;
+        }
+    }
 }
 
 /// What a scan needs to prune for a TopK above it.
@@ -57,9 +91,59 @@ pub struct TopKPruning {
     pub asc: bool,
     pub nulls_first: bool,
     pub boundary: Arc<TopKBoundary>,
+    /// The TopK's k, for stats initialization.
+    pub k: usize,
+    /// Whether the scan may set the boundary from FullMatch stats before
+    /// reading. The planner sets it only when every Filter in between is
+    /// covered by the scan's pushdown predicates.
+    pub init_from_stats: bool,
 }
 
 impl TopKPruning {
+    /// A boundary implied by FullMatch groups alone, or `None`. `full`
+    /// lists the FullMatch groups the scan will read.
+    pub(crate) fn stats_boundary(
+        &self,
+        metadata: &ParquetMetaData,
+        full: &[usize],
+        col_idx: usize,
+        field_type: &DataType,
+    ) -> Option<StatValue> {
+        if !self.init_from_stats || self.nulls_first || self.k == 0 {
+            return None;
+        }
+        // (guaranteed bound, non-NULL rows) per group: every non-NULL value
+        // is >= min (DESC) or <= max (ASC).
+        let mut groups: Vec<(StatValue, u64)> = full
+            .iter()
+            .filter_map(|&g| {
+                let rg = metadata.row_group(g);
+                let stats = rg.column(col_idx).statistics()?;
+                let nulls = stats.null_count_opt()?;
+                let (min, max) = column_bounds(stats, field_type)?;
+                let bound = if self.asc { max? } else { min? };
+                Some((bound, (rg.num_rows().max(0) as u64).saturating_sub(nulls)))
+            })
+            .collect();
+        let asc = self.asc;
+        groups.sort_by(|(a, _), (b, _)| {
+            let o = a.compare(b).unwrap_or(Ordering::Equal);
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
+        });
+        let mut rows = 0u64;
+        for (bound, n) in groups {
+            rows += n;
+            if rows >= self.k as u64 {
+                return Some(bound);
+            }
+        }
+        None
+    }
+
     /// The best first-key value any row of `rg` could have, or `None` if
     /// the group can never be skipped (see the module docs). `field_type`
     /// is the column's Arrow type, which must agree with how its stats are
@@ -131,7 +215,114 @@ mod tests {
             asc,
             nulls_first: false,
             boundary: b,
+            k: 1,
+            init_from_stats: false,
         }
+    }
+
+    /// Groups of 10 rows: [100,110), [90,100), [2,10) plus two NULLs,
+    /// [50,60). Returns the file's metadata.
+    fn stats_file() -> (tempfile::TempDir, std::sync::Arc<ParquetMetaData>) {
+        use arrow::array::Int64Array;
+        use arrow_schema::{Field, Schema};
+        let mut x: Vec<Option<i64>> = (100..110)
+            .chain(90..100)
+            .chain(0..10)
+            .chain(50..60)
+            .map(Some)
+            .collect();
+        x[20] = None;
+        x[21] = None;
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(x))],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.parquet");
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(10)
+            .build();
+        let mut w = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema,
+            Some(props),
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&path).unwrap(),
+        )
+        .unwrap();
+        (dir, b.metadata().clone())
+    }
+
+    fn init(asc: bool, k: usize) -> TopKPruning {
+        TopKPruning {
+            k,
+            init_from_stats: true,
+            ..pruning(asc, None)
+        }
+    }
+
+    #[test]
+    fn stats_boundary_counts_guaranteed_rows() {
+        let (_dir, md) = stats_file();
+        let all = [0, 1, 2, 3];
+        let b =
+            |p: TopKPruning, groups: &[usize]| p.stats_boundary(&md, groups, 0, &DataType::Int64);
+        // DESC, by min: 100 (10 rows), 90 (10), 50 (10), 2 (8 non-NULL).
+        assert_eq!(b(init(false, 5), &all), Some(StatValue::Int(100)));
+        assert_eq!(b(init(false, 20), &all), Some(StatValue::Int(90)));
+        assert_eq!(b(init(false, 21), &all), Some(StatValue::Int(50)));
+        assert_eq!(b(init(false, 38), &all), Some(StatValue::Int(2)));
+        // 38 non-NULL rows in total: k = 39 can't be guaranteed.
+        assert_eq!(b(init(false, 39), &all), None);
+        // ASC, by max: 9 (8 non-NULL rows), 59 (10), ...
+        assert_eq!(b(init(true, 8), &all), Some(StatValue::Int(9)));
+        assert_eq!(b(init(true, 9), &all), Some(StatValue::Int(59)));
+        // Only the groups passed in count.
+        assert_eq!(b(init(false, 15), &[0]), None);
+    }
+
+    #[test]
+    fn stats_boundary_only_when_allowed() {
+        let (_dir, md) = stats_file();
+        let b = |p: TopKPruning| p.stats_boundary(&md, &[0, 1], 0, &DataType::Int64);
+        assert_eq!(
+            b(TopKPruning {
+                init_from_stats: false,
+                ..init(false, 5)
+            }),
+            None
+        );
+        assert_eq!(
+            b(TopKPruning {
+                nulls_first: true,
+                ..init(false, 5)
+            }),
+            None
+        );
+        assert_eq!(b(init(false, 0)), None);
+    }
+
+    #[test]
+    fn tighten_never_loosens() {
+        let p = pruning(false, Some(StatValue::Int(50)));
+        p.boundary.tighten(Some(StatValue::Int(40)), false, false);
+        assert_eq!(p.boundary.get(), Some(StatValue::Int(50)));
+        p.boundary.tighten(None, false, false);
+        assert_eq!(p.boundary.get(), Some(StatValue::Int(50)));
+        p.boundary.tighten(Some(StatValue::Int(60)), false, false);
+        assert_eq!(p.boundary.get(), Some(StatValue::Int(60)));
+        // ASC: smaller is better.
+        let p = pruning(true, Some(StatValue::Int(50)));
+        p.boundary.tighten(Some(StatValue::Int(60)), true, false);
+        assert_eq!(p.boundary.get(), Some(StatValue::Int(50)));
+        p.boundary.tighten(Some(StatValue::Int(40)), true, false);
+        assert_eq!(p.boundary.get(), Some(StatValue::Int(40)));
     }
 
     #[test]

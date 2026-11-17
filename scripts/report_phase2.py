@@ -81,6 +81,65 @@ def load():
     return df, env
 
 
+def extras(df):
+    """Rows for the optional extras: join with exact key sets vs min/max
+    only, and top-k with vs without the stats-initialized boundary."""
+    out = []
+    for t, alt, alt_label, on_label in [
+        ("join", "range", "min/max only", "with exact key sets"),
+        ("topk", "noinit", "without stats init", "with stats init"),
+    ]:
+        d = df[df["technique"] == t]
+        if alt not in set(d["mode"]):
+            continue
+        a = d[d["mode"] == alt].set_index(["dataset", "layout", "query"])
+        o = d[d["mode"] == "on"].set_index(["dataset", "layout", "query"])
+        j = o[["skipped", "row_groups_total", "row_groups_read", "plume_ms"]].join(
+            a[["skipped", "row_groups_read", "plume_ms"]], rsuffix="_alt"
+        )
+        out.append((t, alt_label, on_label, j.reset_index()))
+    return out
+
+
+def extras_section(df):
+    lines = []
+    for t, alt_label, on_label, j in extras(df):
+        lines += [
+            "",
+            "### {}: {} vs {}".format(TECHNIQUE_LABEL[t], on_label, alt_label),
+            "",
+            "| dataset | query | layout | skipped ({}) | skipped ({}) | Plume ms ({}) | Plume ms ({}) |".format(
+                alt_label, on_label, alt_label, on_label),
+            "|---|---|---|---|---|---|---|",
+        ]
+        j = j.assign(_l=j["layout"].map({l: i for i, l in enumerate(LAYOUTS)}))
+        for _, r in j.sort_values(["dataset", "query", "_l"], ascending=[False, True, True]).iterrows():
+            lines.append("| {} | `{}` | {} | {}/{} | {}/{} | {:.1f} | {:.1f} |".format(
+                r["dataset"], r["query"], r["layout"], int(r["skipped_alt"]), int(r["row_groups_total"]),
+                int(r["skipped"]), int(r["row_groups_total"]), r["plume_ms_alt"], r["plume_ms"]))
+    return lines
+
+
+def extras_findings(df):
+    out = []
+    for t, alt_label, on_label, j in extras(df):
+        gained = j[j["skipped"] > j["skipped_alt"]]
+        lost = j[j["skipped"] < j["skipped_alt"]]
+        if len(gained):
+            best = gained.loc[(gained["skipped"] - gained["skipped_alt"]).idxmax()]
+            detail = " Largest gain: `{}` on {} {}, {}/{} → {}/{} row groups skipped, {:.1f} ms → {:.1f} ms.".format(
+                best["query"], best["dataset"], best["layout"], int(best["skipped_alt"]),
+                int(best["row_groups_total"]), int(best["skipped"]), int(best["row_groups_total"]),
+                best["plume_ms_alt"], best["plume_ms"])
+        else:
+            detail = ""
+        out.append(
+            "- **{} {} vs {}:** skipped more row groups in {} of {} measurements and fewer in {}.{}".format(
+                TECHNIQUE_LABEL[t], on_label, alt_label, len(gained), len(j), len(lost), detail)
+        )
+    return out
+
+
 def paired(df):
     """One row per (dataset, layout, query) with on/off side by side."""
     on = df[df["mode"] == "on"].set_index(["dataset", "layout", "query"])
@@ -343,6 +402,7 @@ def main():
         "",
     ]
     md += findings(on, p, env)
+    md += extras_findings(df)
     md += [
         "",
         "## Distribution of row groups skipped, per technique",
@@ -375,6 +435,17 @@ def main():
         "",
     ]
     md += detail_table(p)
+    md += [
+        "",
+        "## Optional extras",
+        "",
+        "Join pruning can send a small build side (up to 1,024 distinct keys) as its exact "
+        "keys instead of min/max; a row group is then skipped unless one of the keys falls in "
+        "its range. Top-k pruning can set its boundary from row-group stats before reading "
+        "anything (§5.4). Each was also measured switched off, with everything else on. The "
+        "\"on\" columns elsewhere on this page have both extras on.",
+    ]
+    md += extras_section(df)
     md += [
         "",
         "## Reproduce",

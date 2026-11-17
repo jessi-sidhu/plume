@@ -78,6 +78,9 @@ pub struct HashJoinExec {
     /// (index into `on`, filter): publish the build keys' range for that
     /// key before the probe side executes. See `crate::join_pruning`.
     dynamic_filters: Vec<(usize, Arc<JoinFilter>)>,
+    /// Send build keys as an exact set when there are at most this many
+    /// distinct ones (0 = always min/max).
+    key_set_max: usize,
 }
 
 impl HashJoinExec {
@@ -99,6 +102,7 @@ impl HashJoinExec {
             join_type,
             schema,
             dynamic_filters: Vec::new(),
+            key_set_max: 0,
         }
     }
 
@@ -108,6 +112,13 @@ impl HashJoinExec {
     /// checks that.
     pub fn with_dynamic_filters(mut self, filters: Vec<(usize, Arc<JoinFilter>)>) -> Self {
         self.dynamic_filters = filters;
+        self
+    }
+
+    /// Publish build keys as an exact set when there are at most `n`
+    /// distinct ones (see `JoinKeyRange::Set`).
+    pub fn with_key_set_max(mut self, n: usize) -> Self {
+        self.key_set_max = n;
         self
     }
 }
@@ -177,7 +188,7 @@ impl ExecutionPlan for HashJoinExec {
         // possibly match, before it plans its reads.
         for (i, f) in &self.dynamic_filters {
             f.set(match key_arrays.get(*i) {
-                Some(a) => key_range(a),
+                Some(a) => key_range(a, self.key_set_max),
                 None => JoinKeyRange::Empty,
             });
         }

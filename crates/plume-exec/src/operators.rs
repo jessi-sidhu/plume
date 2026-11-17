@@ -307,7 +307,7 @@ impl ExecutionPlan for ParquetScanExec {
         // Under top-k pruning each group is its own run, in best-first
         // order, and carries its best possible sort value so the run can
         // be skipped when it is reached.
-        let top_k = self.top_k_setup(&metadata, parquet_schema, &read);
+        let top_k = self.top_k_setup(&metadata, parquet_schema, &read, &classes);
         let mut skip_info: Vec<Option<(StatValue, u64)>> = vec![None; classes.len()];
         let runs: Vec<(Vec<usize>, bool)> = if let Some((_, order)) = &top_k {
             for (g, best) in order {
@@ -441,6 +441,7 @@ impl ParquetScanExec {
         metadata: &ParquetMetaData,
         parquet_schema: &SchemaDescriptor,
         read: &[usize],
+        classes: &[RowGroupMatch],
     ) -> Option<(TopKPruning, Vec<(usize, Option<StatValue>)>)> {
         let p = self.top_k.as_ref()?;
         if self.limit.is_some() || self.limit_hint.is_some() {
@@ -457,6 +458,15 @@ impl ParquetScanExec {
             .map(|&g| (g, p.group_best(metadata.row_group(g), col_idx, field_type)))
             .collect();
         p.read_order(&mut order);
+        // §5.4: a boundary from FullMatch stats, before reading anything.
+        let full: Vec<usize> = read
+            .iter()
+            .copied()
+            .filter(|&g| classes[g] == RowGroupMatch::FullMatch)
+            .collect();
+        if let Some(b) = p.stats_boundary(metadata, &full, col_idx, field_type) {
+            p.boundary.tighten(Some(b), p.asc, p.nulls_first);
+        }
         Some((p.clone(), order))
     }
 }
