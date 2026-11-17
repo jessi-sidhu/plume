@@ -25,6 +25,14 @@ use plume_optimizer::Optimizer;
 const OFF: PlannerOptions = PlannerOptions {
     top_k_pruning: true,
     join_pruning: false,
+    join_key_set: true,
+};
+
+/// Join pruning with min/max ranges only, no exact key sets.
+const RANGE: PlannerOptions = PlannerOptions {
+    top_k_pruning: true,
+    join_pruning: true,
+    join_key_set: false,
 };
 
 struct Files {
@@ -93,11 +101,23 @@ fn run(
     Ok((batches, metrics[0]))
 }
 
-/// Run with join pruning on and off, compare both with DuckDB's `sql`
-/// (order-insensitive), and return the probe scan's metrics when on.
+/// Run with join pruning on, on with min/max only, and off; compare all
+/// three with DuckDB's `sql` (order-insensitive) and return the probe
+/// scan's metrics when fully on. Asserts the exact key set never skips
+/// fewer groups than min/max alone.
 fn check(f: &Files, df: DataFrame, sql: &str) -> Result<ScanMetricsSnapshot> {
+    Ok(check_both(f, df, sql)?.0)
+}
+
+/// `check`, returning (fully on, min/max only) metrics.
+fn check_both(
+    f: &Files,
+    df: DataFrame,
+    sql: &str,
+) -> Result<(ScanMetricsSnapshot, ScanMetricsSnapshot)> {
     let plan = Optimizer::default().optimize(df.into_plan())?;
     let (on, m_on) = run(&plan, PlannerOptions::default())?;
+    let (range, m_range) = run(&plan, RANGE)?;
     let (off, m_off) = run(&plan, OFF)?;
     let expected = duckdb_query(
         sql,
@@ -105,9 +125,11 @@ fn check(f: &Files, df: DataFrame, sql: &str) -> Result<ScanMetricsSnapshot> {
         &[("facts", f.facts.as_path()), ("dims", f.dims.as_path())],
     )?;
     assert_batches_match(&on, &expected, false)?;
+    assert_batches_match(&range, &expected, false)?;
     assert_batches_match(&off, &expected, false)?;
     assert_eq!(m_off.row_groups_pruned_join, 0);
-    Ok(m_on)
+    assert!(m_on.row_groups_pruned_join >= m_range.row_groups_pruned_join);
+    Ok((m_on, m_range))
 }
 
 fn facts(f: &Files) -> DataFrame {
@@ -153,17 +175,19 @@ fn semi_join_prunes_too() -> Result<()> {
 
 #[test]
 fn right_join_prunes_the_probe_and_keeps_unmatched_build_rows() -> Result<()> {
-    // Build keys span [-5, 260]: groups 0-2 can match, 3-9 can't. -5 has
-    // no partner and must still come out, NULL-padded.
+    // Build keys span [-5, 260]: by min/max, groups 0-2 can match and 3-9
+    // can't. The exact keys (-5, 250..260) only hit group 2. -5 has no
+    // partner and must still come out, NULL-padded.
     let mut d = keys(250..260);
     d.push(Some(-5));
     let f = files(d);
-    let m = check(
+    let (m, range) = check_both(
         &f,
         join(&f, facts(&f), JoinType::Right),
         "SELECT * FROM facts RIGHT JOIN dims ON k = dk",
     )?;
-    assert_eq!(m.row_groups_pruned_join, 7);
+    assert_eq!(range.row_groups_pruned_join, 7);
+    assert_eq!(m.row_groups_pruned_join, 9);
     Ok(())
 }
 
@@ -185,17 +209,18 @@ fn prunes_through_a_probe_filter_and_projection() -> Result<()> {
 #[test]
 fn stacks_with_filter_pruning() -> Result<()> {
     // k >= 500 prunes groups 0-4 by stats; the build range [250, 659]
-    // then rules out 7-9. Each group is counted once, under the first
-    // rule that removed it.
+    // then rules out 7-9, and the exact keys rule out 5 as well. Each
+    // group is counted once, under the first rule that removed it.
     let f = files(keys(250..260).into_iter().chain(keys(650..660)).collect());
     let left = facts(&f).filter(col("k").gt_eq(lit(500i64)))?;
-    let m = check(
+    let (m, range) = check_both(
         &f,
         join(&f, left, JoinType::Inner),
         "SELECT * FROM facts JOIN dims ON k = dk WHERE k >= 500",
     )?;
     assert_eq!(m.row_groups_pruned, 5);
-    assert_eq!(m.row_groups_pruned_join, 3);
+    assert_eq!(range.row_groups_pruned_join, 3);
+    assert_eq!(m.row_groups_pruned_join, 4);
     Ok(())
 }
 
@@ -243,6 +268,37 @@ fn all_null_build_keys_match_nothing() -> Result<()> {
         "SELECT * FROM facts RIGHT JOIN dims ON k = dk",
     )?;
     assert_eq!(m.row_groups_pruned_join, 10);
+    Ok(())
+}
+
+#[test]
+fn scattered_keys_prune_only_with_the_exact_set() -> Result<()> {
+    // Keys 99, 500, 995: min/max covers every group, but only groups 0, 5
+    // and 9 hold a key. 99 is group 0's max and 500 is group 5's min, so
+    // an off-by-one at either end of a group would show.
+    let f = files(vec![Some(99), Some(500), Some(995)]);
+    let (m, range) = check_both(
+        &f,
+        join(&f, facts(&f), JoinType::Inner),
+        "SELECT * FROM facts JOIN dims ON k = dk",
+    )?;
+    assert_eq!(range.row_groups_pruned_join, 0);
+    assert_eq!(m.row_groups_pruned_join, 7);
+    Ok(())
+}
+
+#[test]
+fn a_build_side_over_the_set_limit_falls_back_to_min_max() -> Result<()> {
+    // 1025 distinct keys (one over the limit), all even, from 0 to 2048:
+    // as a set they'd miss nothing useful, as a range they cover groups
+    // 0-9 anyway, so both prune nothing; the point is the result.
+    let f = files((0..1025).map(|i| Some(i * 2)).collect());
+    let (m, range) = check_both(
+        &f,
+        join(&f, facts(&f), JoinType::Inner),
+        "SELECT * FROM facts JOIN dims ON k = dk",
+    )?;
+    assert_eq!(m.row_groups_pruned_join, range.row_groups_pruned_join);
     Ok(())
 }
 

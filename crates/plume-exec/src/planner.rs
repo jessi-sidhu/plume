@@ -13,7 +13,7 @@ use crate::aggregate::{AggregateExec, HashAggregateExec};
 use crate::eval::EvalResult;
 use crate::exec::ExecutionPlan;
 use crate::join::{CrossJoinExec, HashJoinExec};
-use crate::join_pruning::{JoinFilter, JoinPruning};
+use crate::join_pruning::{JoinFilter, JoinPruning, JOIN_KEY_SET_MAX};
 use crate::metrics::{ScanMetrics, ScanMetricsSnapshot};
 use crate::operators::{CsvScanExec, FilterExec, LimitExec, ParquetScanExec, ProjectionExec};
 use crate::sort::{SortExec, TopKExec};
@@ -27,6 +27,9 @@ pub struct PlannerOptions {
     pub top_k_pruning: bool,
     /// Let a hash join send its build-side key ranges to the probe scan.
     pub join_pruning: bool,
+    /// With join pruning, send small build sides (up to
+    /// `JOIN_KEY_SET_MAX` distinct keys) as exact key sets, not min/max.
+    pub join_key_set: bool,
 }
 
 impl Default for PlannerOptions {
@@ -34,6 +37,7 @@ impl Default for PlannerOptions {
         Self {
             top_k_pruning: true,
             join_pruning: true,
+            join_key_set: true,
         }
     }
 }
@@ -288,7 +292,12 @@ fn build_with(
                         *join_type,
                         schema.clone(),
                     )
-                    .with_dynamic_filters(dynamic_filters),
+                    .with_dynamic_filters(dynamic_filters)
+                    .with_key_set_max(if options.join_key_set {
+                        JOIN_KEY_SET_MAX
+                    } else {
+                        0
+                    }),
                 ),
             }
         }
