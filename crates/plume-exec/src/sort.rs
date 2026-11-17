@@ -274,7 +274,12 @@ impl ExecutionPlan for TopKExec {
             if let (true, Some(boundary)) = (changed, &self.boundary) {
                 if let Some((batch, row)) = heap.kth() {
                     let first = self.keys[0].expr.evaluate(batch)?;
-                    boundary.set(StatValue::from_array(&first, row));
+                    let o = self.keys[0].options;
+                    boundary.tighten(
+                        StatValue::from_array(&first, row),
+                        !o.descending,
+                        o.nulls_first,
+                    );
                 }
             }
         }

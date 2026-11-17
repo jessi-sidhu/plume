@@ -26,6 +26,7 @@ const OFF: PlannerOptions = PlannerOptions {
     top_k_pruning: true,
     join_pruning: false,
     join_key_set: true,
+    top_k_stats_init: true,
 };
 
 /// Join pruning with min/max ranges only, no exact key sets.
@@ -33,6 +34,7 @@ const RANGE: PlannerOptions = PlannerOptions {
     top_k_pruning: true,
     join_pruning: true,
     join_key_set: false,
+    top_k_stats_init: true,
 };
 
 struct Files {

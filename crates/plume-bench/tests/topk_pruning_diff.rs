@@ -42,6 +42,7 @@ const OFF: PlannerOptions = PlannerOptions {
     top_k_pruning: false,
     join_pruning: true,
     join_key_set: true,
+    top_k_stats_init: true,
 };
 
 fn run(
@@ -150,6 +151,53 @@ fn k_spanning_several_groups_still_prunes_the_rest() -> Result<()> {
     )?;
     assert_eq!(on.row_groups_pruned_topk, 6);
     assert_eq!(on.row_groups_read, 2);
+    Ok(())
+}
+
+#[test]
+fn must_not_use_stats_init_with_an_uncovered_filter() -> Result<()> {
+    // `price * 2 < 1500` can't be pushed to the scan, so every group looks
+    // FullMatch to it. A boundary from those stats would be about 999.9
+    // and rule out the groups holding the real answer (prices just under
+    // 750). The planner must not allow stats initialization here.
+    let Some(p) = sales_path() else {
+        return Ok(());
+    };
+    let df = sales(&p)
+        .filter(col("price").mul(lit(2.0)).lt(lit(1500.0)))?
+        .sort(vec![col("price").desc()])?
+        .limit(10);
+    check(
+        &p,
+        df,
+        "SELECT * FROM t WHERE price * 2 < 1500 ORDER BY price DESC LIMIT 10",
+        "SELECT * FROM t WHERE price * 2 < 1500",
+        &["price"],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn stats_init_with_a_covered_filter_keeps_the_answer() -> Result<()> {
+    // `price < 700` is pushed down: groups 0-4 are FullMatch, group 5
+    // ([625,750)) partial, 6-7 pruned. Stats init may only count groups
+    // 0-4, so the boundary can't exclude group 5, which holds the answer.
+    let Some(p) = sales_path() else {
+        return Ok(());
+    };
+    let df = sales(&p)
+        .filter(col("price").lt(lit(700.0)))?
+        .sort(vec![col("price").desc()])?
+        .limit(10);
+    let (_, on, _) = check(
+        &p,
+        df,
+        "SELECT * FROM t WHERE price < 700 ORDER BY price DESC LIMIT 10",
+        "SELECT * FROM t WHERE price < 700",
+        &["price"],
+    )?;
+    assert_eq!(on.row_groups_pruned, 2);
+    assert_eq!(on.row_groups_pruned_topk, 5);
     Ok(())
 }
 
