@@ -30,6 +30,10 @@
 //!   - topk:   off = `PlannerOptions::top_k_pruning = false`
 //!   - join:   off = `PlannerOptions::join_pruning = false`
 //!
+//! Two techniques get a third mode, for the optional extras:
+//!   - join:   range = join pruning with min/max only, no exact key sets
+//!   - topk:   noinit = top-k pruning without the stats-initialized boundary
+//!
 //! Results are checked with `Workload::verify` in both modes. Each
 //! technique's own skip counter is recorded next to the general scan
 //! metrics, in results/phase2/techniques.csv (plus env.json).
@@ -269,8 +273,30 @@ fn measure_technique(
 
     let (duck_time, expected) = time_runs(runs, || duckdb_run(duck, &q.sql))?;
 
+    let mut modes = vec![("off", &off_plan, off_opts)];
+    match q.technique {
+        Technique::Join => modes.push((
+            "range",
+            &on_plan,
+            PlannerOptions {
+                join_key_set: false,
+                ..on_opts
+            },
+        )),
+        Technique::TopK => modes.push((
+            "noinit",
+            &on_plan,
+            PlannerOptions {
+                top_k_stats_init: false,
+                ..on_opts
+            },
+        )),
+        _ => {}
+    }
+    modes.push(("on", &on_plan, on_opts));
+
     let mut lines = Vec::new();
-    for (mode, plan, opts) in [("off", &off_plan, off_opts), ("on", &on_plan, on_opts)] {
+    for (mode, plan, opts) in modes {
         let (plume_time, (batches, metrics)) = time_runs(runs, || plume_run_with(plan, opts))?;
         q.verify(&batches, &expected, duck)
             .with_context(|| format!("{ctx} {} {mode}: wrong result", q.technique.name()))?;
@@ -309,7 +335,7 @@ fn measure_technique(
             ms(duck_time),
         )?;
         println!(
-            "{ctx:<44} {:<6} {mode:<3}  read {:>3}/{:<3} groups  plume {:>9.1} ms  duckdb {:>8.1} ms",
+            "{ctx:<44} {:<6} {mode:<6}  read {:>3}/{:<3} groups  plume {:>9.1} ms  duckdb {:>8.1} ms",
             q.technique.name(),
             m.row_groups_read,
             m.row_groups_total,

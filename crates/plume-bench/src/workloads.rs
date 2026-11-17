@@ -668,6 +668,14 @@ fn tpch_phase2() -> Vec<Workload> {
                 .and(col("o_orderdate").lt(lit_date("1995-03-08")))
         },
     ));
+    // One customer's orders: a few keys scattered over the whole key
+    // range. Min/max covers almost everything; the exact key set (sent
+    // for builds up to 1,024 keys) hits only the row groups holding them.
+    out.push(tpch_join_workload(
+        "tpch_join_one_customer",
+        "o_custkey = 1",
+        || col("o_custkey").eq(lit(1i64)),
+    ));
     // The first 1% of the key range: the case where the build keys are
     // contiguous, to show what the orderkey layout makes possible.
     out.push(tpch_join_workload(
