@@ -19,9 +19,10 @@ duckdb = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 
 [[bin]]
@@ -31,6 +32,10 @@ path = "src/bin/gen_fixtures.rs"
 [[bin]]
 name = "prepare_datasets"
 path = "src/bin/prepare_datasets.rs"
+
+[[bin]]
+name = "fuzz"
+path = "src/bin/fuzz.rs"
 
 [[bin]]
 name = "prune_bench"

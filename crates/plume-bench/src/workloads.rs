@@ -119,9 +119,47 @@ pub enum Check {
     /// `keys` columns match DuckDB's ordered result row by row, and every
     /// row is in `unlimited_sql`'s result.
     TopK {
-        keys: Vec<&'static str>,
+        keys: Vec<String>,
         unlimited_sql: String,
     },
+}
+
+impl Check {
+    /// Check Plume's `actual` result. `expected` is DuckDB's result for the
+    /// query; `conn` has the query's tables registered as views (for
+    /// checks whose reference is too large to pull out of DuckDB).
+    pub fn verify(
+        &self,
+        actual: &[RecordBatch],
+        expected: &[RecordBatch],
+        conn: &Connection,
+    ) -> Result<()> {
+        match self {
+            Check::Exact => assert_batches_match(actual, expected, false),
+            Check::Limit { k, unlimited_sql } => {
+                let total: i64 = conn.query_row(
+                    &format!("SELECT count(*) FROM ({unlimited_sql})"),
+                    [],
+                    |r| r.get(0),
+                )?;
+                let got: usize = actual.iter().map(|b| b.num_rows()).sum();
+                let want = (*k).min(total as usize);
+                ensure!(
+                    got == want,
+                    "LIMIT {k}: got {got} rows, expected min({k}, {total}) = {want}"
+                );
+                assert_rows_within(conn, actual, unlimited_sql)
+            }
+            Check::TopK {
+                keys,
+                unlimited_sql,
+            } => {
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                assert_sort_keys_match(actual, expected, &keys)?;
+                assert_rows_within(conn, actual, unlimited_sql)
+            }
+        }
+    }
 }
 
 /// Parquet files for one dataset in one layout, keyed by the table names
@@ -223,30 +261,7 @@ impl Workload {
         expected: &[RecordBatch],
         conn: &Connection,
     ) -> Result<()> {
-        match &self.check {
-            Check::Exact => assert_batches_match(actual, expected, false),
-            Check::Limit { k, unlimited_sql } => {
-                let total: i64 = conn.query_row(
-                    &format!("SELECT count(*) FROM ({unlimited_sql})"),
-                    [],
-                    |r| r.get(0),
-                )?;
-                let got: usize = actual.iter().map(|b| b.num_rows()).sum();
-                let want = (*k).min(total as usize);
-                ensure!(
-                    got == want,
-                    "LIMIT {k}: got {got} rows, expected min({k}, {total}) = {want}"
-                );
-                assert_rows_within(conn, actual, unlimited_sql)
-            }
-            Check::TopK {
-                keys,
-                unlimited_sql,
-            } => {
-                assert_sort_keys_match(actual, expected, keys)?;
-                assert_rows_within(conn, actual, unlimited_sql)
-            }
-        }
+        self.check.verify(actual, expected, conn)
     }
 }
 
@@ -604,7 +619,7 @@ fn top_k_workload(
         sql: format!("SELECT {select} FROM {table} ORDER BY {key} DESC LIMIT {k}"),
         technique: Technique::TopK,
         check: Check::TopK {
-            keys: vec![key],
+            keys: vec![key.to_string()],
             unlimited_sql: format!("SELECT {select} FROM {table}"),
         },
         build: Box::new(move |t| {
