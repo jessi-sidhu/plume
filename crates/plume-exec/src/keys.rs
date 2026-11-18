@@ -13,7 +13,7 @@
 //! (NULL ≠ NULL in SQL equi-join semantics).
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int32Type, Int64Type};
+use arrow_array::types::{Date32Type, Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 
@@ -51,6 +51,12 @@ pub fn extract_key(arr: &ArrayRef, row: usize) -> EvalResult<KeyValue> {
         ),
         DataType::Float64 => {
             KeyValue::Float(arr.as_primitive::<Float64Type>().value(row).to_bits())
+        }
+        // Dates (days) and microsecond timestamps key on their integer value;
+        // the caller knows the column type and rebuilds it.
+        DataType::Date32 => KeyValue::Int(arr.as_primitive::<Date32Type>().value(row) as i64),
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+            KeyValue::Int(arr.as_primitive::<TimestampMicrosecondType>().value(row))
         }
         DataType::Utf8 => KeyValue::Str(arr.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => KeyValue::Str(arr.as_string::<i64>().value(row).to_string()),
