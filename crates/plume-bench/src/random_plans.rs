@@ -45,13 +45,28 @@
 //! exactly (any row order) when the result is unique; with the Phase 2
 //! checks when it has ORDER BY (sort keys row by row) or LIMIT without
 //! ORDER BY (row count plus containment).
+//!
+//! # Shrinking
+//!
+//! A failing seed usually comes with thousands of rows and a few operators
+//! that have nothing to do with the bug. `shrink` cuts it down: it drops
+//! query steps (the join, a filter, an operator, the top-level ORDER BY or
+//! LIMIT) and then rows of each table, keeping every cut after which the
+//! case still fails the same way (a wrong result, or an error). Which
+//! mode fails isn't part of that: with a LIMIT over a hash aggregate, the
+//! rows a run returns depend on hash order, so a bug can show up in a
+//! different mode from one run to the next. A
+//! dropped step still draws its random numbers, so the rest of the query
+//! is generated as before; only its output is thrown away. Dropping rows
+//! leaves gaps in `a_id`, which stays sorted.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::{
     ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
@@ -97,10 +112,43 @@ struct Col {
 
 /// A query under construction: the Plume side, the SQL side, and the
 /// output columns they share.
+#[derive(Clone)]
 struct Q {
     df: DataFrame,
     sql: String,
     cols: Vec<Col>,
+}
+
+/// The case's tables: (name, Parquet file).
+type Tables = Vec<(&'static str, PathBuf)>;
+
+/// A part of the generated query that shrinking can drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    /// The join (the body becomes the, maybe filtered, scan of t1).
+    Join,
+    /// The filter on t1 under the join.
+    LeftFilter,
+    /// The filter on t2 under the join.
+    RightFilter,
+    /// The i-th operator over the body.
+    Op(usize),
+    /// The range filter of a pruning-shaped case.
+    RangeFilter,
+    /// The top-level ORDER BY.
+    OrderBy,
+    /// The top-level LIMIT.
+    Limit,
+}
+
+/// How to cut a seed's case down. The default cuts nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Shrink {
+    pub skip: BTreeSet<Step>,
+    /// Rows of t1 to keep, as indexes into the full table; `None` keeps all.
+    pub t1_rows: Option<Vec<usize>>,
+    /// Same for t2.
+    pub t2_rows: Option<Vec<usize>>,
 }
 
 /// One generated test case.
@@ -108,10 +156,14 @@ pub struct Case {
     pub seed: u64,
     /// Keeps the Parquet files alive.
     _dir: tempfile::TempDir,
-    tables: Vec<(&'static str, PathBuf)>,
+    tables: Tables,
     pub df: DataFrame,
     pub sql: String,
     pub check: Check,
+    /// The droppable steps this case applied.
+    pub steps: Vec<Step>,
+    /// Row counts of t1 and t2 before any rows were dropped.
+    pub full_rows: (usize, usize),
 }
 
 const WORDS: [&str; 7] = ["", "a", "ab", "b", "mm", "z", "Z"];
@@ -121,9 +173,20 @@ const US_PER_DAY: i64 = 86_400_000_000;
 struct Gen {
     rng: StdRng,
     next_alias: usize,
+    shrink: Shrink,
+    steps: Vec<Step>,
 }
 
 impl Gen {
+    /// Whether to apply `step`; records it when applied.
+    fn apply(&mut self, step: Step) -> bool {
+        if self.shrink.skip.contains(&step) {
+            false
+        } else {
+            self.steps.push(step);
+            true
+        }
+    }
     fn chance(&mut self, p: f64) -> bool {
         self.rng.gen_bool(p)
     }
@@ -146,6 +209,14 @@ fn opt<T>(g: &mut Gen, null_rate: f64, v: T) -> Option<T> {
     }
 }
 
+/// The rows of `v` listed in `rows`, or all of them.
+fn subset<T: Clone>(v: Vec<T>, rows: &Option<Vec<usize>>) -> Vec<T> {
+    match rows {
+        None => v,
+        Some(rows) => rows.iter().map(|&i| v[i].clone()).collect(),
+    }
+}
+
 fn write(path: &Path, fields: Vec<Field>, cols: Vec<ArrayRef>, rg: usize) -> Result<()> {
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema.clone(), cols)?;
@@ -164,7 +235,8 @@ fn table_sizes(g: &mut Gen) -> (usize, usize) {
     (n1, n2)
 }
 
-fn write_tables(g: &mut Gen, dir: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
+/// Write t1 and t2; returns their paths and full row counts.
+fn write_tables(g: &mut Gen, dir: &Path) -> Result<(Tables, (usize, usize))> {
     let (n1, n2) = table_sizes(g);
     let rg = *g.pick(&[7usize, 64, 500]);
     let nr = *g.pick(&[0.0, 0.1, 0.3]);
@@ -191,6 +263,10 @@ fn write_tables(g: &mut Gen, dir: &Path) -> Result<Vec<(&'static str, PathBuf)>>
             (DAY0 as i64) * US_PER_DAY + i as i64 * 3_600_000_000 + g.rng.gen_range(0..1_000_000);
         a_t.push(opt(g, nr, t));
     }
+    let r1 = g.shrink.t1_rows.clone();
+    let a_id = subset((0..n1 as i64).collect(), &r1);
+    let (a_k, a_i, a_f) = (subset(a_k, &r1), subset(a_i, &r1), subset(a_f, &r1));
+    let (a_s, a_d, a_t) = (subset(a_s, &r1), subset(a_d, &r1), subset(a_t, &r1));
     let t1 = dir.join("t1.parquet");
     write(
         &t1,
@@ -208,7 +284,7 @@ fn write_tables(g: &mut Gen, dir: &Path) -> Result<Vec<(&'static str, PathBuf)>>
             ),
         ],
         vec![
-            Arc::new(Int64Array::from((0..n1 as i64).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(a_id)),
             Arc::new(Int64Array::from(a_k)),
             Arc::new(Int32Array::from(a_i)),
             Arc::new(Float64Array::from(a_f)),
@@ -233,6 +309,9 @@ fn write_tables(g: &mut Gen, dir: &Path) -> Result<Vec<(&'static str, PathBuf)>>
         let f = g.rng.gen_range(-40..=40i32) as f64 * 0.25;
         b_f.push(opt(g, nr, f));
     }
+    let r2 = g.shrink.t2_rows.clone();
+    let (b_k, b_v) = (subset(b_k, &r2), subset(b_v, &r2));
+    let (b_s, b_f) = (subset(b_s, &r2), subset(b_f, &r2));
     let t2 = dir.join("t2.parquet");
     write(
         &t2,
@@ -250,7 +329,7 @@ fn write_tables(g: &mut Gen, dir: &Path) -> Result<Vec<(&'static str, PathBuf)>>
         ],
         rg,
     )?;
-    Ok(vec![("t1", t1), ("t2", t2)])
+    Ok((vec![("t1", t1), ("t2", t2)], (n1, n2)))
 }
 
 fn t1_cols() -> Vec<Col> {
@@ -592,12 +671,17 @@ fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
         return Ok(left);
     }
     if g.chance(0.4) {
-        left = filter(g, left)?;
+        let f = filter(g, left.clone())?;
+        if g.apply(Step::LeftFilter) {
+            left = f;
+        }
     }
     let mut right = scan("t2", &tables[1].1, t2_cols())?;
-    if g.chance(0.4) {
-        right = filter(g, right)?;
-    }
+    let right_filtered = if g.chance(0.4) {
+        Some(filter(g, right.clone())?)
+    } else {
+        None
+    };
     let (jt, kw) = *g.pick(&[
         (JoinType::Inner, "INNER JOIN"),
         (JoinType::Left, "LEFT JOIN"),
@@ -607,6 +691,14 @@ fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
         (JoinType::Anti, "ANTI JOIN"),
     ]);
     let (l, r) = (g.alias("l"), g.alias("r"));
+    if !g.apply(Step::Join) {
+        return Ok(left);
+    }
+    if let Some(f) = right_filtered {
+        if g.apply(Step::RightFilter) {
+            right = f;
+        }
+    }
     let sql = format!(
         "SELECT * FROM ({}) AS {l} {kw} ({}) AS {r} ON {l}.\"a_k\" = {r}.\"b_k\"",
         left.sql, right.sql
@@ -624,34 +716,47 @@ fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
 
 /// Generate the case for `seed`.
 pub fn generate(seed: u64) -> Result<Case> {
+    generate_with(seed, &Shrink::default())
+}
+
+/// Generate the case for `seed`, cut down by `shrink`.
+pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
     let mut g = Gen {
         rng: StdRng::seed_from_u64(seed),
         next_alias: 0,
+        shrink: shrink.clone(),
+        steps: Vec::new(),
     };
     let dir = tempfile::tempdir()?;
-    let tables = write_tables(&mut g, dir.path())?;
+    let (tables, full_rows) = write_tables(&mut g, dir.path())?;
     if g.chance(0.15) {
-        return pruning_shaped(g, seed, dir, tables);
+        return pruning_shaped(g, seed, dir, tables, full_rows);
     }
     let mut q = base(&mut g, &tables)?;
     let mut aggregated = false;
-    for _ in 0..g.rng.gen_range(0..=3) {
-        q = match g.rng.gen_range(0..10) {
-            0..=3 => filter(&mut g, q)?,
-            4..=6 => project(&mut g, q)?,
+    // Keep this draw an i32: another type draws differently and would
+    // change every seed's case.
+    for i in 0..g.rng.gen_range(0..=3i32) {
+        let next = match g.rng.gen_range(0..10) {
+            0..=3 => filter(&mut g, q.clone())?,
+            4..=6 => project(&mut g, q.clone())?,
             7 | 8 if !aggregated => {
                 aggregated = true;
-                aggregate(&mut g, q)?
+                aggregate(&mut g, q.clone())?
             }
-            _ => top_n(&mut g, q)?,
+            _ => top_n(&mut g, q.clone())?,
         };
+        if g.apply(Step::Op(i as usize)) {
+            q = next;
+        }
     }
 
     // Top level: maybe ORDER BY some columns, maybe LIMIT.
     let body_sql = q.sql.clone();
     let sorted = g.chance(0.4);
     let limit = g.chance(0.35).then(|| g.rng.gen_range(0..30usize));
-    let (df, sql, check) = if sorted {
+    let limit = limit.filter(|_| g.apply(Step::Limit));
+    let order = if sorted {
         let mut pool = q.cols.clone();
         let mut chosen = Vec::new();
         for _ in 0..g.rng.gen_range(1..=pool.len().min(3)) {
@@ -659,6 +764,11 @@ pub fn generate(seed: u64) -> Result<Case> {
             chosen.push(pool.remove(i));
         }
         let (keys, keys_sql) = sort_keys(&mut g, &chosen);
+        g.apply(Step::OrderBy).then_some((chosen, keys, keys_sql))
+    } else {
+        None
+    };
+    let (df, sql, check) = if let Some((chosen, keys, keys_sql)) = order {
         let names: Vec<String> = chosen.iter().map(|c| c.name.clone()).collect();
         let mut sql = wrap(&body_sql, "*", &format!(" ORDER BY {keys_sql}"), &mut g);
         let mut df = q.df.sort(keys)?;
@@ -693,6 +803,8 @@ pub fn generate(seed: u64) -> Result<Case> {
         df,
         sql,
         check,
+        steps: g.steps,
+        full_rows,
     })
 }
 
@@ -703,7 +815,8 @@ fn pruning_shaped(
     mut g: Gen,
     seed: u64,
     dir: tempfile::TempDir,
-    tables: Vec<(&'static str, PathBuf)>,
+    tables: Tables,
+    full_rows: (usize, usize),
 ) -> Result<Case> {
     let cols = t1_cols();
     let clustered: Vec<Col> = cols
@@ -740,19 +853,28 @@ fn pruning_shaped(
             &format!(" WHERE {n} >= {los} AND {n} < {his}"),
             &mut g,
         );
-        q = Q {
+        let filtered = Q {
             df: q
                 .df
+                .clone()
                 .filter(col(&c.name).gt_eq(lo).and(col(&c.name).lt(hi)))?,
             sql,
-            cols: q.cols,
+            cols: q.cols.clone(),
         };
+        if g.apply(Step::RangeFilter) {
+            q = filtered;
+        }
     }
     let k = g.rng.gen_range(0..200usize);
     let body_sql = q.sql.clone();
-    let (df, sql, check) = if top_k {
+    let order = if top_k {
         let c = g.pick(&clustered).clone();
         let (keys, keys_sql) = sort_keys(&mut g, std::slice::from_ref(&c));
+        g.apply(Step::OrderBy).then_some((c, keys, keys_sql))
+    } else {
+        None
+    };
+    let (df, sql, check) = if let Some((c, keys, keys_sql)) = order {
         let sql = wrap(
             &body_sql,
             "*",
@@ -785,6 +907,8 @@ fn pruning_shaped(
         df,
         sql,
         check,
+        steps: g.steps,
+        full_rows,
     })
 }
 
@@ -819,10 +943,42 @@ pub struct Coverage {
     pub filter_skipped: bool,
 }
 
+/// How a mode went wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Plume returned an error (or panicked into one).
+    Error,
+    /// Plume returned rows that don't match DuckDB's.
+    WrongResult,
+}
+
+/// A Plume-side failure of one case.
+#[derive(Debug)]
+pub struct Failure {
+    pub mode: &'static str,
+    pub kind: FailureKind,
+    /// Names the seed, mode, SQL and plan.
+    pub error: anyhow::Error,
+}
+
+pub enum Outcome {
+    Pass(Coverage),
+    Fail(Failure),
+}
+
 impl Case {
     /// Run every mode and check each against DuckDB. The error names the
     /// seed, mode, SQL and plan.
     pub fn run(&self) -> Result<Coverage> {
+        match self.outcome()? {
+            Outcome::Pass(cov) => Ok(cov),
+            Outcome::Fail(f) => Err(f.error),
+        }
+    }
+
+    /// Like `run`, but tells a Plume failure apart from a problem with
+    /// the reference side (an `Err`: DuckDB rejected the SQL, say).
+    pub fn outcome(&self) -> Result<Outcome> {
         let mut cov = Coverage::default();
         let conn = crate::harness::reference_connection()?;
         for (name, path) in &self.tables {
@@ -836,9 +992,19 @@ impl Case {
         let expected = duckdb_query(&self.sql, &[], &views)
             .with_context(|| format!("seed {}: DuckDB failed on\n{}", self.seed, self.sql))?;
         let raw = self.df.clone().into_plan();
+        let fail = |mode, kind, error| Ok(Outcome::Fail(Failure { mode, kind, error }));
         for (mode, optimize, opts) in modes() {
             let plan = if optimize {
-                Optimizer::default().optimize(raw.clone())?
+                match Optimizer::default().optimize(raw.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let e = anyhow::Error::from(e).context(format!(
+                            "seed {} ({mode}): optimizer failed\nSQL: {}",
+                            self.seed, self.sql
+                        ));
+                        return fail(mode, FailureKind::Error, e);
+                    }
+                }
             } else {
                 raw.clone()
             };
@@ -850,10 +1016,17 @@ impl Case {
                     plan.explain()
                 )
             };
-            let (actual, metrics) = collect_with_options(&plan, opts).with_context(ctx)?;
-            self.check
+            let (actual, metrics) = match collect_with_options(&plan, opts).with_context(ctx) {
+                Ok(r) => r,
+                Err(e) => return fail(mode, FailureKind::Error, e),
+            };
+            if let Err(e) = self
+                .check
                 .verify(&actual, &expected, &conn)
-                .with_context(ctx)?;
+                .with_context(ctx)
+            {
+                return fail(mode, FailureKind::WrongResult, e);
+            }
             if optimize && opts == PlannerOptions::default() {
                 let text = plan.explain();
                 cov.join = text.contains("Join");
@@ -870,6 +1043,224 @@ impl Case {
                 }
             }
         }
-        Ok(cov)
+        Ok(Outcome::Pass(cov))
     }
+
+    /// The case's Parquet files, by table name.
+    pub fn tables(&self) -> &[(&'static str, PathBuf)] {
+        &self.tables
+    }
+}
+
+// ---- shrinking ----------------------------------------------------------
+
+/// A failing case, cut down as far as it would go.
+pub struct Shrunk {
+    pub case: Case,
+    pub shrink: Shrink,
+    pub failure: Failure,
+    /// Candidate cases tried.
+    pub attempts: usize,
+}
+
+/// Default number of candidates `shrink` tries.
+pub const SHRINK_BUDGET: usize = 2000;
+
+/// Cut `seed`'s case down while it keeps failing the same way (same
+/// `FailureKind`), trying at most `budget` candidates. `Ok(None)` if it
+/// passes.
+pub fn shrink(seed: u64, budget: usize) -> Result<Option<Shrunk>> {
+    let case = generate(seed)?;
+    let Outcome::Fail(first) = case.outcome()? else {
+        return Ok(None);
+    };
+    let kind = first.kind;
+    let mut still_fails = |c: &Case| -> Option<Failure> {
+        match c.outcome() {
+            Ok(Outcome::Fail(f)) if f.kind == kind => Some(f),
+            _ => None,
+        }
+    };
+    Ok(Some(shrink_by(case, first, budget, &mut still_fails)))
+}
+
+/// The shrinking loop, over any notion of "still fails" (tests use a fake
+/// one). `case` must fail with `failure`.
+pub fn shrink_by(
+    case: Case,
+    failure: Failure,
+    budget: usize,
+    still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
+) -> Shrunk {
+    let mut best = Shrunk {
+        case,
+        shrink: Shrink::default(),
+        failure,
+        attempts: 0,
+    };
+    loop {
+        let mut progress = false;
+        let mut steps = best.case.steps.clone();
+        steps.sort();
+        for step in steps {
+            let mut cand = best.shrink.clone();
+            if cand.skip.insert(step) {
+                progress |= attempt(&mut best, cand, budget, still_fails);
+            }
+        }
+        for table in [0, 1] {
+            progress |= shrink_rows(&mut best, table, budget, still_fails);
+        }
+        if !progress || best.attempts >= budget {
+            return best;
+        }
+    }
+}
+
+/// Try `cand`; keep it if it still fails.
+fn attempt(
+    best: &mut Shrunk,
+    cand: Shrink,
+    budget: usize,
+    still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
+) -> bool {
+    if best.attempts >= budget {
+        return false;
+    }
+    best.attempts += 1;
+    let Ok(case) = generate_with(best.case.seed, &cand) else {
+        return false;
+    };
+    match still_fails(&case) {
+        Some(failure) => {
+            best.case = case;
+            best.shrink = cand;
+            best.failure = failure;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drop rows of t1 (`table` 0) or t2 (1): chunks of half the rows, then
+/// quarters, and so on down to single rows.
+fn shrink_rows(
+    best: &mut Shrunk,
+    table: usize,
+    budget: usize,
+    still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
+) -> bool {
+    let rows = |s: &Shrink| if table == 0 { &s.t1_rows } else { &s.t2_rows }.clone();
+    let full = if table == 0 {
+        best.case.full_rows.0
+    } else {
+        best.case.full_rows.1
+    };
+    let mut kept = rows(&best.shrink).unwrap_or_else(|| (0..full).collect());
+    let mut progress = false;
+    let mut chunk = kept.len().div_ceil(2);
+    while chunk > 0 && !kept.is_empty() {
+        let mut i = 0;
+        while i < kept.len() {
+            if best.attempts >= budget {
+                return progress;
+            }
+            let end = (i + chunk).min(kept.len());
+            let fewer: Vec<usize> = kept[..i].iter().chain(&kept[end..]).copied().collect();
+            let mut cand = best.shrink.clone();
+            if table == 0 {
+                cand.t1_rows = Some(fewer.clone());
+            } else {
+                cand.t2_rows = Some(fewer.clone());
+            }
+            if attempt(best, cand, budget, still_fails) {
+                kept = fewer;
+                progress = true;
+            } else {
+                i = end;
+            }
+        }
+        if chunk == 1 {
+            break;
+        }
+        chunk = chunk.div_ceil(2);
+    }
+    progress
+}
+
+impl Shrunk {
+    /// A readable account: what was dropped, the SQL, the remaining
+    /// rows (when few), and the failure.
+    pub fn report(&self) -> String {
+        let c = &self.case;
+        let kept = |rows: &Option<Vec<usize>>, full: usize| rows.as_ref().map_or(full, Vec::len);
+        let (n1, n2) = (
+            kept(&self.shrink.t1_rows, c.full_rows.0),
+            kept(&self.shrink.t2_rows, c.full_rows.1),
+        );
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "shrunk seed {} in {} attempts: dropped {:?}; t1 {} of {} rows, t2 {} of {} rows",
+            c.seed, self.attempts, self.shrink.skip, n1, c.full_rows.0, n2, c.full_rows.1
+        );
+        let _ = writeln!(out, "SQL: {}", c.sql);
+        for (name, path) in &c.tables {
+            match table_rows(path, 20) {
+                Ok(Some(rows)) => {
+                    let _ = writeln!(out, "{name}:");
+                    for r in rows {
+                        let _ = writeln!(out, "  {r}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = writeln!(out, "{name}: can't read: {e:#}");
+                }
+            }
+        }
+        let _ = write!(
+            out,
+            "{:?} in {}: {:#}",
+            self.failure.kind, self.failure.mode, self.failure.error
+        );
+        out
+    }
+
+    /// Copy the shrunk tables and the SQL into `dir`.
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        for (name, path) in &self.case.tables {
+            std::fs::copy(path, dir.join(format!("{name}.parquet")))?;
+        }
+        std::fs::write(dir.join("query.sql"), format!("{}\n", self.case.sql))?;
+        Ok(())
+    }
+}
+
+/// A table's rows as text, or `None` if it has more than `max`.
+fn table_rows(path: &Path, max: usize) -> Result<Option<Vec<String>>> {
+    let conn = crate::harness::reference_connection()?;
+    let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?;
+    let n: usize = conn.query_row(
+        &format!("SELECT count(*) FROM read_parquet('{p}')"),
+        [],
+        |r| r.get(0),
+    )?;
+    if n > max {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(&format!("SELECT * FROM read_parquet('{p}')"))?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let width = row.as_ref().column_count();
+        let mut vals = Vec::with_capacity(width);
+        for i in 0..width {
+            let v: duckdb::types::Value = row.get(i)?;
+            vals.push(format!("{v:?}"));
+        }
+        out.push(vals.join(", "));
+    }
+    Ok(Some(out))
 }

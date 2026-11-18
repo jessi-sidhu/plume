@@ -8,8 +8,13 @@
 //!     --cases <n>    how many consecutive seeds to run (default 1000;
 //!                    1 when --seed is given)
 //!     --keep-going   don't stop at the first failure
+//!     --no-shrink    report failures as generated, without shrinking
+//!     --save <dir>   write each shrunk failure (tables and SQL) to
+//!                    <dir>/seed-<s>/
 
 use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+
 use plume_bench::random_plans;
 
 fn main() -> Result<()> {
@@ -17,6 +22,8 @@ fn main() -> Result<()> {
     let mut cases: Option<u64> = None;
     let mut seed_given = false;
     let mut keep_going = false;
+    let mut shrink = true;
+    let mut save: Option<PathBuf> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -30,6 +37,8 @@ fn main() -> Result<()> {
                 cases = Some(v.parse().with_context(|| format!("bad --cases {v}"))?);
             }
             "--keep-going" => keep_going = true,
+            "--no-shrink" => shrink = false,
+            "--save" => save = Some(it.next().context("--save needs a value")?.into()),
             other => bail!("unknown argument {other}"),
         }
     }
@@ -68,6 +77,20 @@ fn main() -> Result<()> {
         }
         if let Err(e) = outcome {
             eprintln!("FAIL seed {s}: {e:#}\n");
+            if shrink {
+                match random_plans::shrink(s, random_plans::SHRINK_BUDGET) {
+                    Ok(Some(shrunk)) => {
+                        eprintln!("{}\n", shrunk.report());
+                        if let Some(dir) = &save {
+                            let dir = dir.join(format!("seed-{s}"));
+                            shrunk.save(&dir)?;
+                            eprintln!("saved to {}\n", dir.display());
+                        }
+                    }
+                    Ok(None) => eprintln!("(not shrunk: the failure is outside Plume)\n"),
+                    Err(e) => eprintln!("(not shrunk: {e:#})\n"),
+                }
+            }
             failed.push(s);
             if !keep_going {
                 break;
