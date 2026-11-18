@@ -28,12 +28,14 @@ use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type, UInt64Type};
-use arrow_array::{
-    new_null_array, Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-    UInt64Array,
+use arrow_array::types::{
+    Date32Type, Float64Type, Int64Type, TimestampMicrosecondType, UInt64Type,
 };
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray, UInt64Array,
+};
+use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use plume_core::{AggregateFunction, Expr};
 
 use crate::eval::{evaluate, EvalError, EvalResult};
@@ -306,7 +308,9 @@ impl MinMaxAccumulator {
             | DataType::Float32
             | DataType::Float64
             | DataType::Utf8
-            | DataType::LargeUtf8 => {}
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Timestamp(TimeUnit::Microsecond, _) => {}
             other => {
                 return Err(EvalError::NotImplemented(format!("MIN/MAX over {other:?}")));
             }
@@ -412,6 +416,24 @@ impl Accumulator for MinMaxAccumulator {
                     self.merge_i64(v);
                 }
             }
+            DataType::Date32 => {
+                let typed = arr.as_primitive::<Date32Type>();
+                if let Some(v) = match self.direction {
+                    MinOrMax::Min => aggregate::min(typed),
+                    MinOrMax::Max => aggregate::max(typed),
+                } {
+                    self.merge_i64(v as i64);
+                }
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let typed = arr.as_primitive::<TimestampMicrosecondType>();
+                if let Some(v) = match self.direction {
+                    MinOrMax::Min => aggregate::min(typed),
+                    MinOrMax::Max => aggregate::max(typed),
+                } {
+                    self.merge_i64(v);
+                }
+            }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 let casted = cast(&arr, &DataType::UInt64)?;
                 let typed = casted.as_primitive::<UInt64Type>();
@@ -468,6 +490,16 @@ impl Accumulator for MinMaxAccumulator {
                     None => new_null_array(&self.target_dt, 1),
                 }
             }
+            DataType::Date32 => match self.val_i64 {
+                Some(v) => Arc::new(Date32Array::from(vec![v as i32])),
+                None => new_null_array(&self.target_dt, 1),
+            },
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => match self.val_i64 {
+                Some(v) => {
+                    Arc::new(TimestampMicrosecondArray::from(vec![v]).with_timezone_opt(tz.clone()))
+                }
+                None => new_null_array(&self.target_dt, 1),
+            },
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 match self.val_u64 {
                     Some(v) => cast(
@@ -658,6 +690,36 @@ fn build_group_column(target_dt: &DataType, values: &[KeyValue]) -> EvalResult<A
             }
             Arc::new(b.finish())
         }
+        DataType::Date32 => {
+            let mut out = Vec::with_capacity(values.len());
+            for v in values {
+                out.push(match v {
+                    KeyValue::Null => None,
+                    KeyValue::Int(x) => Some(*x as i32),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Date32"
+                        )))
+                    }
+                });
+            }
+            Arc::new(Date32Array::from(out))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let mut out = Vec::with_capacity(values.len());
+            for v in values {
+                out.push(match v {
+                    KeyValue::Null => None,
+                    KeyValue::Int(x) => Some(*x),
+                    other => {
+                        return Err(EvalError::NotImplemented(format!(
+                            "group key {other:?} into Timestamp"
+                        )))
+                    }
+                });
+            }
+            Arc::new(TimestampMicrosecondArray::from(out).with_timezone_opt(tz.clone()))
+        }
         other => {
             return Err(EvalError::NotImplemented(format!(
                 "group output column type {other:?}"
@@ -703,6 +765,11 @@ impl ExecutionPlan for HashAggregateExec {
         let mut state: HashMap<Vec<KeyValue>, Vec<Box<dyn Accumulator>>> = HashMap::new();
         let agg_exprs = self.agg_exprs.clone();
         let group_exprs = self.group_exprs.clone();
+        // Surface unsupported aggregate types as errors now, so creating
+        // accumulators per group below can't fail.
+        for e in &agg_exprs {
+            create_accumulator(e, input_schema.as_ref())?;
+        }
 
         for batch in self.input.execute()? {
             let batch = batch?;
@@ -719,10 +786,9 @@ impl ExecutionPlan for HashAggregateExec {
                 }
                 let row_batch = batch.slice(row, 1); // O(1) — adjusts offset only
                 let accs = state.entry(key).or_insert_with(|| {
-                    // create_accumulator's failure modes (unsupported types,
-                    // missing columns) were all caught at plan-build time by
-                    // LogicalPlan::aggregate's schema validation, so this
-                    // expect is genuinely unreachable.
+                    // Every expression was turned into an accumulator once
+                    // before the loop (errors returned there), so this
+                    // can't fail.
                     agg_exprs
                         .iter()
                         .map(|e| {
@@ -735,6 +801,12 @@ impl ExecutionPlan for HashAggregateExec {
                     acc.update_batch(&row_batch)?;
                 }
             }
+        }
+
+        // No input rows means no groups: GROUP BY returns no rows (unlike a
+        // global aggregate, which returns one).
+        if state.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
         }
 
         // Finalize. Drain state into parallel vecs so we can build group cols

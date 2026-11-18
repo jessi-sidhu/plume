@@ -100,6 +100,21 @@ fn batches_to_rows(batches: &[RecordBatch]) -> Result<Vec<Vec<String>>> {
     Ok(rows)
 }
 
+/// An in-memory DuckDB connection for computing reference results.
+///
+/// DuckDB 1.2.2's `compressed_materialization` optimizer trips a debug
+/// assertion (compress_integral.cpp, `min_val <= input`) on some queries
+/// that filter an integer column and then sort, as the randomized tests
+/// found. Debug builds of libduckdb abort the process on it; release builds
+/// return the right answer. It's an internal storage optimization, so
+/// turning it off doesn't change any result.
+pub fn reference_connection() -> Result<Connection> {
+    let conn = Connection::open_in_memory().context("open duckdb in-memory")?;
+    conn.execute_batch("SET disabled_optimizers = 'compressed_materialization';")
+        .context("disable compressed_materialization")?;
+    Ok(conn)
+}
+
 /// Run `sql` in an embedded DuckDB and return the result as RecordBatches.
 /// `register_csvs` and `register_parquets` are (table_name, path) pairs that
 /// are made available to the query as views over the file.
@@ -108,7 +123,7 @@ pub fn duckdb_query(
     register_csvs: &[(&str, &Path)],
     register_parquets: &[(&str, &Path)],
 ) -> Result<Vec<RecordBatch>> {
-    let conn = Connection::open_in_memory().context("open duckdb in-memory")?;
+    let conn = reference_connection()?;
     for (name, path) in register_csvs {
         let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 csv path"))?;
         conn.execute_batch(&format!(

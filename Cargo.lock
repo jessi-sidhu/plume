@@ -1291,6 +1291,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "chrono",
  "criterion",
  "duckdb",
  "parquet",
