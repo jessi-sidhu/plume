@@ -57,7 +57,6 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use duckdb::Connection;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use plume_core::{
