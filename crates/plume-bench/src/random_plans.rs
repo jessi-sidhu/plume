@@ -60,7 +60,7 @@
 //! is generated as before; only its output is thrown away. Dropping rows
 //! leaves gaps in `a_id`, which stays sorted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -89,7 +89,7 @@ use crate::workloads::Check;
 
 /// Column types the generator uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ty {
+pub(crate) enum Ty {
     I64,
     I32,
     F64,
@@ -99,28 +99,40 @@ enum Ty {
 }
 
 impl Ty {
-    fn numeric(self) -> bool {
+    pub(crate) fn numeric(self) -> bool {
         matches!(self, Ty::I64 | Ty::I32 | Ty::F64)
     }
 }
 
 #[derive(Debug, Clone)]
-struct Col {
-    name: String,
-    ty: Ty,
+pub(crate) struct Col {
+    pub(crate) name: String,
+    pub(crate) ty: Ty,
 }
 
 /// A query under construction: the Plume side, the SQL side, and the
 /// output columns they share.
 #[derive(Clone)]
-struct Q {
-    df: DataFrame,
-    sql: String,
-    cols: Vec<Col>,
+pub(crate) struct Q {
+    pub(crate) df: DataFrame,
+    pub(crate) sql: String,
+    pub(crate) cols: Vec<Col>,
 }
 
 /// The case's tables: (name, Parquet file).
-type Tables = Vec<(&'static str, PathBuf)>;
+pub(crate) type Tables = Vec<(&'static str, PathBuf)>;
+
+/// Literal values to compare a column with, by column name, as (Plume,
+/// SQL), sorted ascending. Columns without samples get generated ones.
+pub(crate) type Samples = HashMap<String, Vec<(Expr, String)>>;
+
+/// The two tables a case's body starts from, and how they join.
+pub(crate) struct Source {
+    pub(crate) left: (&'static str, PathBuf, Vec<Col>),
+    pub(crate) right: (&'static str, PathBuf, Vec<Col>),
+    /// (left column, right column).
+    pub(crate) keys: (String, String),
+}
 
 /// A part of the generated query that shrinking can drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -155,11 +167,14 @@ pub struct Shrink {
 pub struct Case {
     pub seed: u64,
     /// Keeps the Parquet files alive.
-    _dir: tempfile::TempDir,
-    tables: Tables,
+    pub(crate) _dir: tempfile::TempDir,
+    pub(crate) tables: Tables,
     pub df: DataFrame,
     pub sql: String,
     pub check: Check,
+    /// Skip the unoptimized run (real data: a plan without column pruning
+    /// or top-k reads and sorts every column of millions of rows).
+    pub(crate) optimized_only: bool,
     /// The droppable steps this case applied.
     pub steps: Vec<Step>,
     /// Row counts of t1 and t2 before any rows were dropped.
@@ -170,16 +185,31 @@ const WORDS: [&str; 7] = ["", "a", "ab", "b", "mm", "z", "Z"];
 const DAY0: i32 = 19_000; // 2022-01-08
 const US_PER_DAY: i64 = 86_400_000_000;
 
-struct Gen {
-    rng: StdRng,
-    next_alias: usize,
-    shrink: Shrink,
-    steps: Vec<Step>,
+pub(crate) struct Gen {
+    pub(crate) rng: StdRng,
+    pub(crate) next_alias: usize,
+    pub(crate) shrink: Shrink,
+    pub(crate) steps: Vec<Step>,
+    pub(crate) samples: Arc<Samples>,
+    /// Allow SUM and AVG over floats. Off for real data, whose floats
+    /// aren't exact in binary, so the two engines' sums can differ in the
+    /// last bits depending on the order they add in.
+    pub(crate) float_sums: bool,
 }
 
 impl Gen {
+    pub(crate) fn new(seed: u64, shrink: &Shrink) -> Self {
+        Gen {
+            rng: StdRng::seed_from_u64(seed),
+            next_alias: 0,
+            shrink: shrink.clone(),
+            steps: Vec::new(),
+            samples: Arc::new(Samples::new()),
+            float_sums: true,
+        }
+    }
     /// Whether to apply `step`; records it when applied.
-    fn apply(&mut self, step: Step) -> bool {
+    pub(crate) fn apply(&mut self, step: Step) -> bool {
         if self.shrink.skip.contains(&step) {
             false
         } else {
@@ -187,14 +217,14 @@ impl Gen {
             true
         }
     }
-    fn chance(&mut self, p: f64) -> bool {
+    pub(crate) fn chance(&mut self, p: f64) -> bool {
         self.rng.gen_bool(p)
     }
-    fn alias(&mut self, prefix: &str) -> String {
+    pub(crate) fn alias(&mut self, prefix: &str) -> String {
         self.next_alias += 1;
         format!("{prefix}{}", self.next_alias)
     }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.rng.gen_range(0..xs.len())]
     }
 }
@@ -361,7 +391,7 @@ fn t2_cols() -> Vec<Col> {
 
 // ---- expressions --------------------------------------------------------
 
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{name}\"")
 }
 
@@ -397,13 +427,22 @@ fn literal(g: &mut Gen, ty: Ty) -> (Expr, String) {
     }
 }
 
-fn date_str(days: i32) -> String {
+/// A literal to compare `c` with: one of its samples if it has any.
+fn literal_for(g: &mut Gen, c: &Col) -> (Expr, String) {
+    let samples = g.samples.clone();
+    match samples.get(&c.name) {
+        Some(vals) if !vals.is_empty() => g.pick(vals).clone(),
+        _ => literal(g, c.ty),
+    }
+}
+
+pub(crate) fn date_str(days: i32) -> String {
     let d =
         chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap() + chrono::Duration::days(days as i64);
     d.format("%Y-%m-%d").to_string()
 }
 
-fn ts_str(us: i64) -> String {
+pub(crate) fn ts_str(us: i64) -> String {
     let t = chrono::DateTime::from_timestamp_micros(us)
         .unwrap()
         .naive_utc();
@@ -470,7 +509,7 @@ fn predicate(g: &mut Gen, cols: &[Col], depth: u32) -> (Expr, String) {
     let (r, rs) = if c.ty.numeric() && g.chance(0.3) {
         value(g, cols, c.ty, 1)
     } else {
-        literal(g, c.ty)
+        literal_for(g, &c)
     };
     let (op, sym) = *g.pick(&[
         ("eq", "="),
@@ -506,12 +545,12 @@ fn predicate(g: &mut Gen, cols: &[Col], depth: u32) -> (Expr, String) {
 
 // ---- plan operators -----------------------------------------------------
 
-fn wrap(inner: &str, select: &str, rest: &str, g: &mut Gen) -> String {
+pub(crate) fn wrap(inner: &str, select: &str, rest: &str, g: &mut Gen) -> String {
     let a = g.alias("q");
     format!("SELECT {select} FROM ({inner}) AS {a}{rest}")
 }
 
-fn scan(name: &str, path: &Path, cols: Vec<Col>) -> Result<Q> {
+pub(crate) fn scan(name: &str, path: &Path, cols: Vec<Col>) -> Result<Q> {
     Ok(Q {
         df: scan_parquet_auto(path)?,
         sql: format!("SELECT * FROM {name}"),
@@ -597,11 +636,11 @@ fn aggregate(g: &mut Gen, q: Q) -> Result<Q> {
                 format!("count({})", quote(&c.name)),
                 Ty::I64,
             ),
-            2 if c.ty.numeric() => {
+            2 if c.ty.numeric() && (c.ty != Ty::F64 || g.float_sums) => {
                 let ty = if c.ty == Ty::F64 { Ty::F64 } else { Ty::I64 };
                 (sum(col(&c.name)), format!("sum({})", quote(&c.name)), ty)
             }
-            3 if c.ty.numeric() => (
+            3 if c.ty.numeric() && (c.ty != Ty::F64 || g.float_sums) => (
                 avg(col(&c.name)),
                 format!("avg({})", quote(&c.name)),
                 Ty::F64,
@@ -629,7 +668,7 @@ fn aggregate(g: &mut Gen, q: Q) -> Result<Q> {
 }
 
 /// Random direction and NULL placement for each of `cols`.
-fn sort_keys(g: &mut Gen, cols: &[Col]) -> (Vec<SortExpr>, String) {
+pub(crate) fn sort_keys(g: &mut Gen, cols: &[Col]) -> (Vec<SortExpr>, String) {
     let mut keys = Vec::new();
     let mut sql = Vec::new();
     for c in cols {
@@ -665,8 +704,9 @@ fn top_n(g: &mut Gen, q: Q) -> Result<Q> {
     })
 }
 
-fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
-    let mut left = scan("t1", &tables[0].1, t1_cols())?;
+/// The body's start: a scan of the left table, or the two tables joined.
+pub(crate) fn base(g: &mut Gen, src: &Source) -> Result<Q> {
+    let mut left = scan(src.left.0, &src.left.1, src.left.2.clone())?;
     if !g.chance(0.4) {
         return Ok(left);
     }
@@ -676,7 +716,7 @@ fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
             left = f;
         }
     }
-    let mut right = scan("t2", &tables[1].1, t2_cols())?;
+    let mut right = scan(src.right.0, &src.right.1, src.right.2.clone())?;
     let right_filtered = if g.chance(0.4) {
         Some(filter(g, right.clone())?)
     } else {
@@ -699,16 +739,20 @@ fn base(g: &mut Gen, tables: &[(&'static str, PathBuf)]) -> Result<Q> {
             right = f;
         }
     }
+    let (lk, rk) = &src.keys;
     let sql = format!(
-        "SELECT * FROM ({}) AS {l} {kw} ({}) AS {r} ON {l}.\"a_k\" = {r}.\"b_k\"",
-        left.sql, right.sql
+        "SELECT * FROM ({}) AS {l} {kw} ({}) AS {r} ON {l}.{} = {r}.{}",
+        left.sql,
+        right.sql,
+        quote(lk),
+        quote(rk)
     );
     let mut cols = left.cols;
     if !matches!(jt, JoinType::Semi | JoinType::Anti) {
         cols.extend(right.cols);
     }
     Ok(Q {
-        df: left.df.join(right.df, vec![(col("a_k"), col("b_k"))], jt)?,
+        df: left.df.join(right.df, vec![(col(lk), col(rk))], jt)?,
         sql,
         cols,
     })
@@ -721,30 +765,51 @@ pub fn generate(seed: u64) -> Result<Case> {
 
 /// Generate the case for `seed`, cut down by `shrink`.
 pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
-    let mut g = Gen {
-        rng: StdRng::seed_from_u64(seed),
-        next_alias: 0,
-        shrink: shrink.clone(),
-        steps: Vec::new(),
-    };
+    let mut g = Gen::new(seed, shrink);
     let dir = tempfile::tempdir()?;
     let (tables, full_rows) = write_tables(&mut g, dir.path())?;
     if g.chance(0.15) {
         return pruning_shaped(g, seed, dir, tables, full_rows);
     }
-    let mut q = base(&mut g, &tables)?;
+    let src = Source {
+        left: ("t1", tables[0].1.clone(), t1_cols()),
+        right: ("t2", tables[1].1.clone(), t2_cols()),
+        keys: ("a_k".into(), "b_k".into()),
+    };
+    let q = base(&mut g, &src)?;
+    let (df, sql, check) = finish(&mut g, q, false)?;
+    Ok(Case {
+        seed,
+        _dir: dir,
+        tables,
+        df,
+        sql,
+        check,
+        optimized_only: false,
+        steps: g.steps,
+        full_rows,
+    })
+}
+
+/// Up to three operators over the body, then the top level: maybe ORDER
+/// BY, maybe LIMIT (always, with `force_limit`).
+pub(crate) fn finish(
+    g: &mut Gen,
+    mut q: Q,
+    force_limit: bool,
+) -> Result<(DataFrame, String, Check)> {
     let mut aggregated = false;
     // Keep this draw an i32: another type draws differently and would
     // change every seed's case.
     for i in 0..g.rng.gen_range(0..=3i32) {
         let next = match g.rng.gen_range(0..10) {
-            0..=3 => filter(&mut g, q.clone())?,
-            4..=6 => project(&mut g, q.clone())?,
+            0..=3 => filter(g, q.clone())?,
+            4..=6 => project(g, q.clone())?,
             7 | 8 if !aggregated => {
                 aggregated = true;
-                aggregate(&mut g, q.clone())?
+                aggregate(g, q.clone())?
             }
-            _ => top_n(&mut g, q.clone())?,
+            _ => top_n(g, q.clone())?,
         };
         if g.apply(Step::Op(i as usize)) {
             q = next;
@@ -754,7 +819,11 @@ pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
     // Top level: maybe ORDER BY some columns, maybe LIMIT.
     let body_sql = q.sql.clone();
     let sorted = g.chance(0.4);
-    let limit = g.chance(0.35).then(|| g.rng.gen_range(0..30usize));
+    let limit = if force_limit {
+        Some(g.rng.gen_range(0..100usize))
+    } else {
+        g.chance(0.35).then(|| g.rng.gen_range(0..30usize))
+    };
     let limit = limit.filter(|_| g.apply(Step::Limit));
     let order = if sorted {
         let mut pool = q.cols.clone();
@@ -763,14 +832,14 @@ pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
             let i = g.rng.gen_range(0..pool.len());
             chosen.push(pool.remove(i));
         }
-        let (keys, keys_sql) = sort_keys(&mut g, &chosen);
+        let (keys, keys_sql) = sort_keys(g, &chosen);
         g.apply(Step::OrderBy).then_some((chosen, keys, keys_sql))
     } else {
         None
     };
     let (df, sql, check) = if let Some((chosen, keys, keys_sql)) = order {
         let names: Vec<String> = chosen.iter().map(|c| c.name.clone()).collect();
-        let mut sql = wrap(&body_sql, "*", &format!(" ORDER BY {keys_sql}"), &mut g);
+        let mut sql = wrap(&body_sql, "*", &format!(" ORDER BY {keys_sql}"), g);
         let mut df = q.df.sort(keys)?;
         if let Some(n) = limit {
             write!(sql, " LIMIT {n}")?;
@@ -787,7 +856,7 @@ pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
     } else if let Some(n) = limit {
         (
             q.df.limit(n),
-            wrap(&body_sql, "*", &format!(" LIMIT {n}"), &mut g),
+            wrap(&body_sql, "*", &format!(" LIMIT {n}"), g),
             Check::Limit {
                 k: n,
                 unlimited_sql: body_sql,
@@ -796,16 +865,7 @@ pub fn generate_with(seed: u64, shrink: &Shrink) -> Result<Case> {
     } else {
         (q.df, body_sql, Check::Exact)
     };
-    Ok(Case {
-        seed,
-        _dir: dir,
-        tables,
-        df,
-        sql,
-        check,
-        steps: g.steps,
-        full_rows,
-    })
+    Ok((df, sql, check))
 }
 
 /// A shape random generation rarely hits but LIMIT and top-k pruning need:
@@ -907,6 +967,7 @@ fn pruning_shaped(
         df,
         sql,
         check,
+        optimized_only: false,
         steps: g.steps,
         full_rows,
     })
@@ -994,6 +1055,9 @@ impl Case {
         let raw = self.df.clone().into_plan();
         let fail = |mode, kind, error| Ok(Outcome::Fail(Failure { mode, kind, error }));
         for (mode, optimize, opts) in modes() {
+            if self.optimized_only && !optimize {
+                continue;
+            }
             let plan = if optimize {
                 match Optimizer::default().optimize(raw.clone()) {
                     Ok(p) => p,
@@ -1070,7 +1134,18 @@ pub const SHRINK_BUDGET: usize = 2000;
 /// `FailureKind`), trying at most `budget` candidates. `Ok(None)` if it
 /// passes.
 pub fn shrink(seed: u64, budget: usize) -> Result<Option<Shrunk>> {
-    let case = generate(seed)?;
+    shrink_with(seed, budget, &|s| generate_with(seed, s))
+}
+
+/// `shrink` over any generator: `regen` builds the seed's case cut down
+/// by a `Shrink`.
+pub fn shrink_with(
+    seed: u64,
+    budget: usize,
+    regen: &dyn Fn(&Shrink) -> Result<Case>,
+) -> Result<Option<Shrunk>> {
+    let case = regen(&Shrink::default())?;
+    debug_assert_eq!(case.seed, seed);
     let Outcome::Fail(first) = case.outcome()? else {
         return Ok(None);
     };
@@ -1081,7 +1156,13 @@ pub fn shrink(seed: u64, budget: usize) -> Result<Option<Shrunk>> {
             _ => None,
         }
     };
-    Ok(Some(shrink_by(case, first, budget, &mut still_fails)))
+    Ok(Some(shrink_by(
+        case,
+        first,
+        budget,
+        regen,
+        &mut still_fails,
+    )))
 }
 
 /// The shrinking loop, over any notion of "still fails" (tests use a fake
@@ -1090,6 +1171,7 @@ pub fn shrink_by(
     case: Case,
     failure: Failure,
     budget: usize,
+    regen: &dyn Fn(&Shrink) -> Result<Case>,
     still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
 ) -> Shrunk {
     let mut best = Shrunk {
@@ -1105,11 +1187,11 @@ pub fn shrink_by(
         for step in steps {
             let mut cand = best.shrink.clone();
             if cand.skip.insert(step) {
-                progress |= attempt(&mut best, cand, budget, still_fails);
+                progress |= attempt(&mut best, cand, budget, regen, still_fails);
             }
         }
         for table in [0, 1] {
-            progress |= shrink_rows(&mut best, table, budget, still_fails);
+            progress |= shrink_rows(&mut best, table, budget, regen, still_fails);
         }
         if !progress || best.attempts >= budget {
             return best;
@@ -1122,13 +1204,14 @@ fn attempt(
     best: &mut Shrunk,
     cand: Shrink,
     budget: usize,
+    regen: &dyn Fn(&Shrink) -> Result<Case>,
     still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
 ) -> bool {
     if best.attempts >= budget {
         return false;
     }
     best.attempts += 1;
-    let Ok(case) = generate_with(best.case.seed, &cand) else {
+    let Ok(case) = regen(&cand) else {
         return false;
     };
     match still_fails(&case) {
@@ -1148,6 +1231,7 @@ fn shrink_rows(
     best: &mut Shrunk,
     table: usize,
     budget: usize,
+    regen: &dyn Fn(&Shrink) -> Result<Case>,
     still_fails: &mut dyn FnMut(&Case) -> Option<Failure>,
 ) -> bool {
     let rows = |s: &Shrink| if table == 0 { &s.t1_rows } else { &s.t2_rows }.clone();
@@ -1173,7 +1257,7 @@ fn shrink_rows(
             } else {
                 cand.t2_rows = Some(fewer.clone());
             }
-            if attempt(best, cand, budget, still_fails) {
+            if attempt(best, cand, budget, regen, still_fails) {
                 kept = fewer;
                 progress = true;
             } else {
@@ -1227,11 +1311,20 @@ impl Shrunk {
         out
     }
 
-    /// Copy the shrunk tables and the SQL into `dir`.
+    /// Copy the shrunk tables and the SQL into `dir`. Real-data tables
+    /// are too big to copy: `tables.txt` lists their paths instead.
     pub fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
-        for (name, path) in &self.case.tables {
-            std::fs::copy(path, dir.join(format!("{name}.parquet")))?;
+        if self.case.optimized_only {
+            let mut list = String::new();
+            for (name, path) in &self.case.tables {
+                writeln!(list, "{name} {}", path.display())?;
+            }
+            std::fs::write(dir.join("tables.txt"), list)?;
+        } else {
+            for (name, path) in &self.case.tables {
+                std::fs::copy(path, dir.join(format!("{name}.parquet")))?;
+            }
         }
         std::fs::write(dir.join("query.sql"), format!("{}\n", self.case.sql))?;
         Ok(())

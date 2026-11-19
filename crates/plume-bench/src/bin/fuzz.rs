@@ -1,7 +1,9 @@
-//! Run randomized differential tests (see `plume_bench::random_plans`).
+//! Run randomized differential tests (see `plume_bench::random_plans`,
+//! and `plume_bench::random_real` for `--real`).
 //!
 //!     cargo run --release -p plume-bench --bin fuzz -- --cases 10000
 //!     cargo run -p plume-bench --bin fuzz -- --seed 1234      # replay one
+//!     cargo run --release -p plume-bench --bin fuzz -- --real tpch --cases 200
 //!
 //! Options:
 //!     --seed <s>     first seed (default 0)
@@ -11,11 +13,16 @@
 //!     --no-shrink    report failures as generated, without shrinking
 //!     --save <dir>   write each shrunk failure (tables and SQL) to
 //!                    <dir>/seed-<s>/
+//!     --real <ds>    query the real dataset `tpch` or `taxi` (needs
+//!                    `prepare_datasets`) instead of generated tables
+//!     --data-dir <d> where the real datasets are (default data)
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
 use plume_bench::random_plans;
+use plume_bench::random_real::{self, RealSource};
+use plume_bench::workloads::Dataset;
 
 fn main() -> Result<()> {
     let mut seed = 0u64;
@@ -24,6 +31,8 @@ fn main() -> Result<()> {
     let mut keep_going = false;
     let mut shrink = true;
     let mut save: Option<PathBuf> = None;
+    let mut real: Option<Dataset> = None;
+    let mut data_dir = PathBuf::from("data");
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -39,10 +48,32 @@ fn main() -> Result<()> {
             "--keep-going" => keep_going = true,
             "--no-shrink" => shrink = false,
             "--save" => save = Some(it.next().context("--save needs a value")?.into()),
+            "--real" => {
+                real = Some(match it.next().as_deref() {
+                    Some("tpch") => Dataset::Tpch,
+                    Some("taxi") => Dataset::Taxi,
+                    v => bail!("--real takes tpch or taxi, not {v:?}"),
+                })
+            }
+            "--data-dir" => data_dir = it.next().context("--data-dir needs a value")?.into(),
             other => bail!("unknown argument {other}"),
         }
     }
     let cases = cases.unwrap_or(if seed_given { 1 } else { 1000 });
+    let sources: Vec<RealSource> = match real {
+        Some(ds) => {
+            eprintln!("sampling {} columns...", ds.name());
+            RealSource::load_all(&data_dir, ds)?
+        }
+        None => Vec::new(),
+    };
+    let generate = |s: u64| {
+        if sources.is_empty() {
+            random_plans::generate(s)
+        } else {
+            random_real::generate(&sources, s)
+        }
+    };
     let mut failed = Vec::new();
     let mut counts = [0u64; 10];
     // PLUME_FUZZ_TRACE=1 prints each seed before running it, to find a
@@ -52,8 +83,12 @@ fn main() -> Result<()> {
         if trace {
             eprintln!("seed {s}");
         }
-        let outcome = random_plans::generate(s).and_then(|c| {
+        let outcome = generate(s).and_then(|c| {
             if seed_given && cases == 1 {
+                if !sources.is_empty() {
+                    let src = random_real::source_for(&sources, s);
+                    println!("layout: {} {}", src.dataset.name(), src.layout);
+                }
                 println!("SQL: {}", c.sql);
             }
             c.run()
@@ -78,7 +113,13 @@ fn main() -> Result<()> {
         if let Err(e) = outcome {
             eprintln!("FAIL seed {s}: {e:#}\n");
             if shrink {
-                match random_plans::shrink(s, random_plans::SHRINK_BUDGET) {
+                let budget = random_plans::SHRINK_BUDGET;
+                let shrunk = if sources.is_empty() {
+                    random_plans::shrink(s, budget)
+                } else {
+                    random_real::shrink(&sources, s, budget)
+                };
+                match shrunk {
                     Ok(Some(shrunk)) => {
                         eprintln!("{}\n", shrunk.report());
                         if let Some(dir) = &save {

@@ -2,4 +2,5 @@
 
 pub mod harness;
 pub mod random_plans;
+pub mod random_real;
 pub mod workloads;

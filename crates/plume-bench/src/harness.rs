@@ -112,6 +112,10 @@ pub fn reference_connection() -> Result<Connection> {
     let conn = Connection::open_in_memory().context("open duckdb in-memory")?;
     conn.execute_batch("SET disabled_optimizers = 'compressed_materialization';")
         .context("disable compressed_materialization")?;
+    // A query bigger than memory spills to disk; cap it so a big reference
+    // query fails instead of filling the disk.
+    conn.execute_batch("SET max_temp_directory_size = '4GiB';")
+        .context("cap temp directory size")?;
     Ok(conn)
 }
 
@@ -319,14 +323,41 @@ pub fn assert_rows_within(
         w.close()?;
     }
     let p = path.to_str().ok_or_else(|| anyhow!("non-utf8 temp path"))?;
+    // The number of returned rows `EXCEPT ALL` the reference would leave:
+    // for each distinct returned row, how many more times it was returned
+    // than the reference has it. Written as a join from the (small)
+    // returned rows into the reference so DuckDB never holds the whole
+    // reference result, which can be millions of rows.
+    let cols: Vec<String> = first
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| format!("\"{}\"", f.name().replace('"', "\"\"")))
+        .collect();
+    let list = |prefix: &str| {
+        cols.iter()
+            .map(|c| format!("{prefix}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let same = |l: &str, r: &str| {
+        cols.iter()
+            .map(|c| format!("{l}.{c} IS NOT DISTINCT FROM {r}.{c}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let sql = format!(
+        "WITH a AS (SELECT {a_cols}, count(*) AS plume_n FROM read_parquet('{p}') AS a GROUP BY ALL), \
+              hits AS (SELECT {a_cols}, count(*) AS plume_c FROM a JOIN ({reference_sql}) AS r \
+                       ON {a_r} GROUP BY ALL) \
+         SELECT coalesce(sum(greatest(a.plume_n - coalesce(hits.plume_c, 0), 0)), 0)::BIGINT \
+         FROM a LEFT JOIN hits ON {a_hits}",
+        a_cols = list("a"),
+        a_r = same("a", "r"),
+        a_hits = same("a", "hits"),
+    );
     let extra: Result<i64> = conn
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM (SELECT * FROM read_parquet('{p}') EXCEPT ALL ({reference_sql}))"
-            ),
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&sql, [], |r| r.get(0))
         .with_context(|| format!("containment check against `{reference_sql}`"));
     let _ = std::fs::remove_file(&path);
     let extra = extra?;
