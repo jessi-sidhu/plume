@@ -11,3 +11,6 @@ perf.data*
 # Phase 1 datasets (TPC-H, NYC taxi) are large and downloaded/generated;
 # rebuild via `cargo run --release -p plume-bench --bin prepare_datasets`.
 /data/
+
+# DuckDB spill files
+.tmp/

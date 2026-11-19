@@ -42,7 +42,8 @@ fn shrinks_to_the_rows_and_steps_the_failure_needs() -> Result<()> {
         .map(|s| (s, generate(s).unwrap()))
         .find(|(_, c)| fails(c).is_some() && !c.steps.is_empty() && c.full_rows.1 > 0)
         .expect("some seed has two a_k = 3 rows, steps, and a non-empty t2");
-    let shrunk = shrink_by(case, fake_failure(), 5000, &mut fails);
+    let regen = |s: &Shrink| generate_with(seed, s);
+    let shrunk = shrink_by(case, fake_failure(), 5000, &regen, &mut fails);
     assert_eq!(shrunk.case.seed, seed);
     assert_eq!(shrunk.shrink.t1_rows.as_ref().map(Vec::len), Some(2));
     assert_eq!(shrunk.shrink.t2_rows.as_deref(), Some(&[][..]));
@@ -54,7 +55,8 @@ fn shrinks_to_the_rows_and_steps_the_failure_needs() -> Result<()> {
 #[test]
 fn a_passing_case_is_left_alone() -> Result<()> {
     let mut never = |_: &Case| -> Option<Failure> { None };
-    let shrunk = shrink_by(generate(1)?, fake_failure(), 100, &mut never);
+    let regen = |s: &Shrink| generate_with(1, s);
+    let shrunk = shrink_by(generate(1)?, fake_failure(), 100, &regen, &mut never);
     assert!(shrunk.shrink.skip.is_empty());
     assert!(shrunk.shrink.t1_rows.is_none() && shrunk.shrink.t2_rows.is_none());
     Ok(())
