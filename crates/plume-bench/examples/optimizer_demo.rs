@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     println!("{}", explain_optimized(&plan, &optimized));
 
     println!();
-    println!("Four of the five rules fired here:");
+    println!("Four of the seven rules fired here:");
     println!("  * ConstantFolding: (100 + 50) collapsed to 150 in the predicate.");
     println!("  * DeadProjectionElim: the SELECT-* projection is gone.");
     println!("  * PredicatePushdown: 'pushdown=[(price > 150)]' attached to the scan.");
