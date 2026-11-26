@@ -8,7 +8,7 @@ use anyhow::Result;
 use arrow_array::{Date32Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, run_rendered};
 use plume_core::{col, count_star, lit, max, min, JoinType};
 use plume_exec::collect;
 use plume_io::scan_parquet_auto;
@@ -64,6 +64,7 @@ fn check(df: plume_core::DataFrame, sql: &str, path: &Path) -> Result<()> {
     for plan in [raw.clone(), Optimizer::default().optimize(raw)?] {
         let out = collect(&plan)?;
         assert_matches_duckdb(&out, sql, &[], &[("t", path)], false)?;
+        assert_matches_duckdb(&run_rendered(&plan)?, sql, &[], &[("t", path)], false)?;
     }
     Ok(())
 }
@@ -145,6 +146,13 @@ fn join_on_a_date_key() -> Result<()> {
         .join(right, vec![(col("d"), col("d2"))], JoinType::Inner)?
         .into_plan();
     let out = collect(&raw)?;
+    assert_matches_duckdb(
+        &run_rendered(&raw)?,
+        "SELECT a.*, b.d AS d2, b.k AS k2 FROM t a JOIN t b ON a.d = b.d",
+        &[],
+        &[("t", &p)],
+        false,
+    )?;
     assert_matches_duckdb(
         &out,
         "SELECT a.*, b.d AS d2, b.k AS k2 FROM t a JOIN t b ON a.d = b.d",

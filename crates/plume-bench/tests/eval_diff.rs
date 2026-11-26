@@ -10,9 +10,10 @@ use arrow_array::{
     Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
-use plume_bench::harness::{assert_matches_duckdb, write_batch_parquet};
+use plume_bench::harness::{assert_matches_duckdb, run_rendered, write_batch_parquet};
 use plume_core::{col, lit, not, Expr};
 use plume_exec::evaluate;
+use plume_io::scan_parquet_auto;
 use tempfile::TempDir;
 
 /// Helper: evaluate `expr` on `batch`, wrap result as a one-column RecordBatch
@@ -30,13 +31,14 @@ fn diff_expr(batch: &RecordBatch, expr: &Expr, sql_select: &str) -> Result<()> {
     let out_batch = RecordBatch::try_new(out_schema, vec![result])?;
 
     let sql = format!("SELECT {sql_select} AS r FROM t");
-    assert_matches_duckdb(
-        std::slice::from_ref(&out_batch),
-        &sql,
-        &[],
-        &[("t", parquet.as_path() as &Path)],
-        true,
-    )
+    let tables = [("t", parquet.as_path() as &Path)];
+    assert_matches_duckdb(std::slice::from_ref(&out_batch), &sql, &[], &tables, true)?;
+
+    // The same expression as a projection, rendered back to SQL.
+    let plan = scan_parquet_auto(&parquet)?
+        .project(vec![expr.clone().alias("r")])?
+        .into_plan();
+    assert_matches_duckdb(&run_rendered(&plan)?, &sql, &[], &tables, true)
 }
 
 // ---- fixtures ----------------------------------------------------------

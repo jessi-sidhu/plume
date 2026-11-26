@@ -1,7 +1,7 @@
 //! NOT, IS NULL and IS NOT NULL end to end. Each filter runs unoptimized
 //! and optimized (pushdown + row-group pruning), both results must match
 //! DuckDB, and the scan must skip exactly the row groups the null counts
-//! allow.
+//! allow. The plan rendered back to SQL must match too.
 //!
 //! The file has 4 row groups of 10 rows. Column `v` has no NULLs in
 //! groups 0 and 3, only NULLs in group 1, and a mix in group 2. Column
@@ -16,7 +16,7 @@ use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::{assert_batches_match, duckdb_query};
+use plume_bench::harness::{assert_batches_match, duckdb_query, run_rendered};
 use plume_core::{col, lit, not, Expr};
 use plume_exec::{collect, collect_with_options, PlannerOptions};
 use plume_io::scan_parquet_auto;
@@ -77,10 +77,13 @@ fn check(predicate: Expr, sql: &str) -> Result<u64> {
         &[("t", path.as_path())],
     )?;
 
+    assert_batches_match(&run_rendered(&plan)?, &expected, false)?;
     let unoptimized = collect(&plan)?;
     assert_batches_match(&unoptimized, &expected, false)?;
 
-    let (optimized, metrics) = collect_with_options(&optimize(plan)?, PlannerOptions::default())?;
+    let optimized_plan = optimize(plan)?;
+    assert_batches_match(&run_rendered(&optimized_plan)?, &expected, false)?;
+    let (optimized, metrics) = collect_with_options(&optimized_plan, PlannerOptions::default())?;
     assert_batches_match(&optimized, &expected, false)?;
     assert_eq!(metrics[0].row_groups_total, 4);
     Ok(metrics[0].row_groups_pruned)

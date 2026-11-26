@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, assert_rendered_matches};
 use plume_core::{col, count_star, lit, sum, LogicalPlan};
 use plume_exec::{collect, ExecutionPlan, ParquetScanExec};
 use plume_io::{read_parquet_schema, scan_parquet_auto};
@@ -35,20 +35,24 @@ fn sales_path() -> Option<PathBuf> {
 }
 
 fn diff_three_ways_unordered(plan: LogicalPlan, p: &Path, sql: &str) -> Result<()> {
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], false)?;
     let unoptimized = collect(&plan)?;
     let optimized_plan = optimize(plan)?;
     let optimized = collect(&optimized_plan)?;
     assert_matches_duckdb(&unoptimized, sql, &[], &[("sales", p)], false)?;
     assert_matches_duckdb(&optimized, sql, &[], &[("sales", p)], false)?;
+    assert_rendered_matches(&optimized_plan, sql, &[], &[("sales", p)], false)?;
     Ok(())
 }
 
 fn diff_three_ways_ordered(plan: LogicalPlan, p: &Path, sql: &str) -> Result<()> {
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], true)?;
     let unoptimized = collect(&plan)?;
     let optimized_plan = optimize(plan)?;
     let optimized = collect(&optimized_plan)?;
     assert_matches_duckdb(&unoptimized, sql, &[], &[("sales", p)], true)?;
     assert_matches_duckdb(&optimized, sql, &[], &[("sales", p)], true)?;
+    assert_rendered_matches(&optimized_plan, sql, &[], &[("sales", p)], true)?;
     Ok(())
 }
 

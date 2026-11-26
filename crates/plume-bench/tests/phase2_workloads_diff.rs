@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use plume_bench::harness::duckdb_query;
+use plume_bench::harness::{duckdb_query, run_rendered};
 use plume_bench::workloads::{self, Dataset, Tables, Technique};
 use plume_exec::collect;
 use plume_optimizer::Optimizer;
@@ -56,6 +56,8 @@ fn check_dataset(dataset: Dataset) -> Result<()> {
                 duckdb_query(&q.sql, &[], &tables.duckdb_views()).with_context(|| ctx.clone())?;
             q.verify(&actual, &expected, &conn)
                 .with_context(|| ctx.clone())?;
+            q.verify(&run_rendered(&plan)?, &expected, &conn)
+                .with_context(|| format!("{ctx} rendered SQL"))?;
             eprintln!("ok {ctx}");
         }
     }

@@ -18,7 +18,7 @@ use arrow_array::{Date32Array, Float64Array, Int64Array, RecordBatch, StringArra
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::{assert_valid_sorted_result, duckdb_query};
+use plume_bench::harness::{assert_valid_sorted_result, duckdb_query, run_rendered};
 use plume_core::{col, lit, DataFrame, LogicalPlan, SortExpr};
 use plume_exec::collect;
 use plume_io::scan_parquet_auto;
@@ -105,6 +105,7 @@ fn check(
         None => expected.clone(),
     };
     assert_valid_sorted_result(&actual, &expected, keys, &all)?;
+    assert_valid_sorted_result(&run_rendered(&plan)?, &expected, keys, &all)?;
     Ok(plan)
 }
 

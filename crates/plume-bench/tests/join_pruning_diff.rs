@@ -16,7 +16,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::{assert_batches_match, duckdb_query};
+use plume_bench::harness::{assert_batches_match, duckdb_query, run_rendered};
 use plume_core::{col, lit, DataFrame, JoinType, LogicalPlan};
 use plume_exec::{collect_with_options, PlannerOptions, ScanMetricsSnapshot};
 use plume_io::scan_parquet_auto;
@@ -129,6 +129,7 @@ fn check_both(
     assert_batches_match(&on, &expected, false)?;
     assert_batches_match(&range, &expected, false)?;
     assert_batches_match(&off, &expected, false)?;
+    assert_batches_match(&run_rendered(&plan)?, &expected, false)?;
     assert_eq!(m_off.row_groups_pruned_join, 0);
     assert!(m_on.row_groups_pruned_join >= m_range.row_groups_pruned_join);
     Ok((m_on, m_range))
@@ -439,6 +440,7 @@ fn tpch_join(
         )?;
         assert_batches_match(&on, &expected, false)?;
         assert_batches_match(&off, &expected, false)?;
+        assert_batches_match(&run_rendered(&plan)?, &expected, false)?;
         assert_eq!(m_off.row_groups_pruned_join, 0);
         eprintln!(
             "tpch {layout}: {}/{} lineitem row groups pruned by the join",

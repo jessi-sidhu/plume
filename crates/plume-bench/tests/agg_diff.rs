@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, assert_rendered_matches};
 use plume_core::{avg, col, count, count_star, lit, max, min, sum, DataFrame};
 use plume_exec::collect;
 
@@ -34,7 +34,9 @@ fn people_schema() -> SchemaRef {
 }
 
 fn diff(df: DataFrame, csv: &Path, sql: &str) -> Result<()> {
-    let actual = collect(&df.into_plan())?;
+    let plan = df.into_plan();
+    assert_rendered_matches(&plan, sql, &[("people", csv)], &[], true)?;
+    let actual = collect(&plan)?;
     assert_matches_duckdb(&actual, sql, &[("people", csv)], &[], true)
 }
 

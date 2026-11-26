@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, assert_rendered_matches};
 use plume_core::{col, lit, DataFrame};
 use plume_exec::collect;
 
@@ -44,7 +44,9 @@ fn people_schema() -> SchemaRef {
 /// should be order-preserving (filter and projection retain input order),
 /// so we use the order-sensitive harness comparison.
 fn diff_pipeline(df: DataFrame, csv: &Path, sql: &str) -> Result<()> {
-    let actual = collect(&df.into_plan())?;
+    let plan = df.into_plan();
+    assert_rendered_matches(&plan, sql, &[("people", csv)], &[], true)?;
+    let actual = collect(&plan)?;
     assert_matches_duckdb(&actual, sql, &[("people", csv)], &[], true)
 }
 
