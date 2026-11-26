@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use plume_core::{
-    col, count_star, lit, sum, BinaryOperator, DataFrame, Expr, LogicalPlan, ScalarValue,
+    col, count_star, lit, not, sum, BinaryOperator, DataFrame, Expr, LogicalPlan, ScalarValue,
 };
 use plume_optimizer::{
     explain_optimized, ColumnPruning, ConstantFolding, DeadProjectionElim, LimitPushdown,
@@ -281,4 +281,65 @@ fn nested_limits_take_the_smaller() {
     } else {
         panic!();
     }
+}
+
+fn fold_predicate(predicate: Expr) -> Expr {
+    let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
+        .filter(predicate)
+        .unwrap()
+        .into_plan();
+    let LogicalPlan::Filter { predicate, .. } = ConstantFolding.rewrite(plan).unwrap() else {
+        panic!("expected Filter at top");
+    };
+    predicate
+}
+
+#[test]
+fn constant_folding_flips_not_of_a_literal() {
+    // NOT (1 > 2) -> NOT false -> true, then true AND x -> x.
+    let p = fold_predicate(not(lit(1_i32).gt(lit(2_i32))).and(col("region").eq(lit("west"))));
+    assert_eq!(p.display_name(), "(region = \"west\")");
+    let p = fold_predicate(not(lit(true)));
+    assert!(
+        matches!(p, Expr::Literal(ScalarValue::Boolean(false))),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn constant_folding_leaves_not_null_unknown() {
+    // NOT NULL is NULL, not true or false, so it must not fold to a bool.
+    let p = fold_predicate(not(Expr::Literal(ScalarValue::Null)));
+    assert!(
+        !matches!(p, Expr::Literal(ScalarValue::Boolean(_))),
+        "NOT NULL folded to a definite bool: {p:?}"
+    );
+}
+
+#[test]
+fn constant_folding_evaluates_null_checks_on_literals() {
+    let p = fold_predicate(Expr::Literal(ScalarValue::Null).is_null());
+    assert!(
+        matches!(p, Expr::Literal(ScalarValue::Boolean(true))),
+        "{p:?}"
+    );
+    let p = fold_predicate(lit(3_i32).is_null());
+    assert!(
+        matches!(p, Expr::Literal(ScalarValue::Boolean(false))),
+        "{p:?}"
+    );
+    let p = fold_predicate(lit(3_i32).is_not_null());
+    assert!(
+        matches!(p, Expr::Literal(ScalarValue::Boolean(true))),
+        "{p:?}"
+    );
+    // Folding reaches inside: (1 + 2) IS NULL -> false.
+    let p = fold_predicate(lit(1_i32).plus(lit(2_i32)).is_null());
+    assert!(
+        matches!(p, Expr::Literal(ScalarValue::Boolean(false))),
+        "{p:?}"
+    );
+    // A column is left alone.
+    let p = fold_predicate(col("price").is_null());
+    assert_eq!(p.display_name(), "(price IS NULL)");
 }

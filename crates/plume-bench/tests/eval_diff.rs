@@ -11,7 +11,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use plume_bench::harness::{assert_matches_duckdb, write_batch_parquet};
-use plume_core::{col, lit, Expr};
+use plume_core::{col, lit, not, Expr};
 use plume_exec::evaluate;
 use tempfile::TempDir;
 
@@ -292,4 +292,51 @@ fn alias_does_not_affect_result() -> Result<()> {
 fn null_in_comparison_propagates() -> Result<()> {
     // Specifically: rows where b IS NULL should yield NULL in `b > 0`.
     diff_expr(&ints_with_nulls(), &col("b").gt(lit(0_i32)), "b > 0")
+}
+
+// ---- NOT / IS NULL / IS NOT NULL ----------------------------------------
+// `bools()` holds TRUE, FALSE and NULL in both columns, so each test covers
+// all three truth values of the operand.
+
+#[test]
+fn not_over_all_three_truth_values() -> Result<()> {
+    diff_expr(&bools(), &not(col("x")), "NOT x")
+}
+
+#[test]
+fn not_of_kleene_and() -> Result<()> {
+    diff_expr(&bools(), &not(col("x").and(col("y"))), "NOT (x AND y)")
+}
+
+#[test]
+fn not_of_comparison_with_nulls() -> Result<()> {
+    diff_expr(
+        &ints_with_nulls(),
+        &not(col("a").gt(lit(2_i32))),
+        "NOT (a > 2)",
+    )
+}
+
+#[test]
+fn is_null_over_all_three_truth_values() -> Result<()> {
+    diff_expr(&bools(), &col("x").is_null(), "x IS NULL")
+}
+
+#[test]
+fn is_not_null_over_all_three_truth_values() -> Result<()> {
+    diff_expr(&bools(), &col("x").is_not_null(), "x IS NOT NULL")
+}
+
+#[test]
+fn is_null_of_comparison() -> Result<()> {
+    diff_expr(
+        &ints_with_nulls(),
+        &col("a").gt(col("b")).is_null(),
+        "(a > b) IS NULL",
+    )
+}
+
+#[test]
+fn not_is_null_on_strings() -> Result<()> {
+    diff_expr(&names(), &not(col("name").is_null()), "NOT (name IS NULL)")
 }

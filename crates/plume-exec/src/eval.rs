@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use arrow::compute::kernels::{boolean, cmp, numeric};
+use arrow::compute::{is_not_null, is_null};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
@@ -62,7 +63,19 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> EvalResult<ArrayRef> {
         }
         Expr::Aggregate { .. } => Err(EvalError::AggregateInScalarContext),
         Expr::Alias { expr, .. } => evaluate(expr, batch),
+        Expr::Not(inner) => apply_not(&evaluate(inner, batch)?),
+        Expr::IsNull(inner) => Ok(Arc::new(is_null(evaluate(inner, batch)?.as_ref())?)),
+        Expr::IsNotNull(inner) => Ok(Arc::new(is_not_null(evaluate(inner, batch)?.as_ref())?)),
     }
+}
+
+/// `NOT` on a Boolean array. Arrow's `not` kernel keeps the null mask, so
+/// `NOT NULL` stays NULL (three-valued logic).
+pub(crate) fn apply_not(arr: &ArrayRef) -> EvalResult<ArrayRef> {
+    if arr.data_type() != &DataType::Boolean {
+        return Err(EvalError::PredicateNotBoolean(arr.data_type().clone()));
+    }
+    Ok(Arc::new(boolean::not(arr.as_boolean())?))
 }
 
 /// Evaluate `expr` and require the result to be a `BooleanArray`. Caller-side
