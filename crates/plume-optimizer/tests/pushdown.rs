@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use plume_core::{col, count_star, lit, sum, DataFrame, LogicalPlan};
+use plume_core::{col, count_star, lit, not, sum, DataFrame, LogicalPlan};
 use plume_optimizer::{optimize, pushdown_predicates};
 
 fn sales_schema() -> SchemaRef {
@@ -193,4 +193,28 @@ fn optimize_runs_pushdown_then_pruning_in_one_call() {
     assert!(proj.contains(&"price".to_string()));
     assert!(proj.contains(&"quantity".to_string()));
     assert!(!proj.contains(&"order_id".to_string()));
+}
+
+#[test]
+fn null_checks_are_pushed_to_parquet_scan() {
+    let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
+        .filter(col("price").is_null().and(col("region").is_not_null()))
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    let preds = scan_pushdowns(&optimized).unwrap();
+    assert_eq!(preds.len(), 2);
+    assert!(preds.contains(&"(price IS NULL)".to_string()));
+    assert!(preds.contains(&"(region IS NOT NULL)".to_string()));
+}
+
+#[test]
+fn not_is_not_pushed_to_parquet_scan() {
+    let plan = DataFrame::scan_parquet("sales.parquet", sales_schema())
+        .filter(not(col("price").gt(lit(500.0_f64))).and(col("quantity").gt(lit(1_i32))))
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    let preds = scan_pushdowns(&optimized).unwrap();
+    assert_eq!(preds, vec!["(quantity > 1)"]);
 }

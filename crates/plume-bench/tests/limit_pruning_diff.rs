@@ -18,7 +18,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::{assert_valid_limit_result, duckdb_query};
+use plume_bench::harness::{assert_valid_limit_result, duckdb_query, run_rendered};
 use plume_core::{col, lit, DataFrame, Expr};
 use plume_exec::{collect_with_metrics, ScanMetricsSnapshot};
 use plume_io::scan_parquet_auto;
@@ -78,6 +78,7 @@ fn check(
     let (off, m_off) = run(df()?, &without_limit_pruning())?;
     assert_valid_limit_result(&on, &unlimited, k)?;
     assert_valid_limit_result(&off, &unlimited, k)?;
+    assert_valid_limit_result(&run_rendered(&df()?.into_plan())?, &unlimited, k)?;
     Ok((m_on, m_off))
 }
 

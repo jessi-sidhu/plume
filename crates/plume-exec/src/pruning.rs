@@ -84,6 +84,9 @@ pub(crate) fn classify_predicate(
     parquet_root: &Type,
 ) -> RowGroupMatch {
     use RowGroupMatch::*;
+    if let Expr::IsNull(inner) | Expr::IsNotNull(inner) = pred {
+        return classify_null_check(inner, matches!(pred, Expr::IsNull(_)), rg, parquet_root);
+    }
     // Pull `col OP lit` out of the predicate. The optimizer normalized to
     // column-on-the-left already, so we don't have to flip operators here.
     let Expr::BinaryOp { left, op, right } = pred else {
@@ -174,6 +177,44 @@ pub(crate) fn classify_predicate(
             classify_ord(s.min_opt().copied(), s.max_opt().copied(), op, *v, full_ok)
         }
         // Type mismatch / unsupported combo: the group could match.
+        _ => PartialMatch,
+    }
+}
+
+/// Classify `col IS NULL` (`is_null`) or `col IS NOT NULL` from the
+/// group's null count. Only an exact count proves anything; without one
+/// the group is `PartialMatch`.
+fn classify_null_check(
+    inner: &Expr,
+    is_null: bool,
+    rg: &RowGroupMetaData,
+    parquet_root: &Type,
+) -> RowGroupMatch {
+    use RowGroupMatch::*;
+    let Expr::Column(name) = inner else {
+        return PartialMatch;
+    };
+    let Some(col_idx) = parquet_root
+        .get_fields()
+        .iter()
+        .position(|f| f.name() == name)
+    else {
+        return PartialMatch;
+    };
+    let Some(nulls) = rg
+        .column(col_idx)
+        .statistics()
+        .and_then(|s| s.null_count_opt())
+    else {
+        return PartialMatch;
+    };
+    let rows = rg.num_rows() as u64;
+    let (none_null, all_null) = (nulls == 0, nulls == rows);
+    match (is_null, none_null, all_null) {
+        // An empty group is both; it has no rows to keep either way.
+        (_, true, true) => NoMatch,
+        (true, true, _) | (false, _, true) => NoMatch,
+        (true, _, true) | (false, true, _) => FullMatch,
         _ => PartialMatch,
     }
 }
@@ -594,5 +635,49 @@ mod tests {
         assert_eq!(c(&[full.clone(), partial.clone()]), PartialMatch);
         assert_eq!(c(&[full.clone(), none.clone()]), NoMatch);
         assert_eq!(c(&[partial, none]), NoMatch);
+    }
+
+    #[test]
+    fn is_null_uses_exact_null_count() {
+        let x = || col("x");
+        // No NULLs: IS NULL skips, IS NOT NULL keeps everything.
+        let g = int64_group(10, 20, Some(0));
+        assert_eq!(classify(x().is_null(), &g), NoMatch);
+        assert_eq!(classify(x().is_not_null(), &g), FullMatch);
+        // Some NULLs: both partial.
+        let g = int64_group(10, 20, Some(3));
+        assert_eq!(classify(x().is_null(), &g), PartialMatch);
+        assert_eq!(classify(x().is_not_null(), &g), PartialMatch);
+        // All NULL: IS NOT NULL skips, IS NULL keeps everything.
+        let g = int64_group(10, 20, Some(ROWS as u64));
+        assert_eq!(classify(x().is_null(), &g), FullMatch);
+        assert_eq!(classify(x().is_not_null(), &g), NoMatch);
+    }
+
+    #[test]
+    fn null_check_without_a_count_is_partial() {
+        let g = int64_group(10, 20, None);
+        assert_eq!(classify(col("x").is_null(), &g), PartialMatch);
+        assert_eq!(classify(col("x").is_not_null(), &g), PartialMatch);
+        let g = group(primitive("x", PhysicalType::INT64, None), None);
+        assert_eq!(classify(col("x").is_null(), &g), PartialMatch);
+        // Unknown column, and a non-column operand.
+        let g = int64_group(10, 20, Some(0));
+        assert_eq!(classify(col("y").is_null(), &g), PartialMatch);
+        assert_eq!(classify(col("x").gt(lit(5i64)).is_null(), &g), PartialMatch);
+    }
+
+    #[test]
+    fn not_is_never_used_for_pruning() {
+        // x > 99 alone would skip this group; NOT (x > 99) must not, and
+        // NOT (x > 0) must not skip either, even though no row passes.
+        let g = int64_group(10, 20, Some(0));
+        assert_eq!(classify(not_(col("x").gt(lit(99i64))), &g), PartialMatch);
+        assert_eq!(classify(not_(col("x").gt(lit(0i64))), &g), PartialMatch);
+        assert_eq!(classify(not_(col("x").is_null()), &g), PartialMatch);
+    }
+
+    fn not_(e: Expr) -> Expr {
+        plume_core::not(e)
     }
 }

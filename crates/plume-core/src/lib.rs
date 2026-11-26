@@ -25,7 +25,7 @@ pub type Result<T> = std::result::Result<T, PlumeError>;
 pub use dataframe::DataFrame;
 pub use expr::{
     avg, col, conjuncts, count, count_star, lit, lit_date, lit_timestamp, max, min,
-    normalize_pushable, predicate_covered_by, sum, AggregateFunction, BinaryOperator, Expr,
+    normalize_pushable, not, predicate_covered_by, sum, AggregateFunction, BinaryOperator, Expr,
     ScalarValue, SortExpr,
 };
 pub use plan::{JoinType, LogicalPlan, ScanSource};

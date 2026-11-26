@@ -9,7 +9,7 @@ use arrow_array::{
     Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
-use plume_core::{col, lit, Expr, ScalarValue};
+use plume_core::{col, lit, not, Expr, ScalarValue};
 use plume_exec::{evaluate, evaluate_predicate, EvalError};
 
 fn ints_with_nulls() -> RecordBatch {
@@ -293,4 +293,61 @@ fn int64_round_trip_preserves_value() {
     let out = evaluate(&col("id").plus(lit(100_i64)), &batch).unwrap();
     let arr = out.as_primitive::<Int64Type>();
     assert_eq!(arr.value(2), 103);
+}
+
+#[test]
+fn not_follows_three_valued_logic() {
+    // Column a of bools_for_kleene: T T N F F N N T F. NOT NULL stays NULL.
+    let batch = bools_for_kleene();
+    let out = evaluate_predicate(&not(col("a")), &batch).unwrap();
+    let expected = BooleanArray::from(vec![
+        Some(false),
+        Some(false),
+        None,
+        Some(true),
+        Some(true),
+        None,
+        None,
+        Some(false),
+        Some(true),
+    ]);
+    assert_eq!(&out, &expected);
+}
+
+#[test]
+fn not_of_comparison_keeps_null_rows_null() {
+    // a = 1 2 N 4 5, so NOT (a > 2) = T T N F F.
+    let out = evaluate_predicate(&not(col("a").gt(lit(2_i32))), &ints_with_nulls()).unwrap();
+    let expected = BooleanArray::from(vec![Some(true), Some(true), None, Some(false), Some(false)]);
+    assert_eq!(&out, &expected);
+}
+
+#[test]
+fn not_rejects_non_boolean_input() {
+    assert!(evaluate(&not(col("a")), &ints_with_nulls()).is_err());
+}
+
+#[test]
+fn is_null_and_is_not_null_never_return_null() {
+    // b = 10 N 30 40 5
+    let batch = ints_with_nulls();
+    let out = evaluate_predicate(&col("b").is_null(), &batch).unwrap();
+    assert_eq!(
+        out,
+        BooleanArray::from(vec![false, true, false, false, false])
+    );
+    assert_eq!(out.null_count(), 0);
+    let out = evaluate_predicate(&col("b").is_not_null(), &batch).unwrap();
+    assert_eq!(out, BooleanArray::from(vec![true, false, true, true, true]));
+    assert_eq!(out.null_count(), 0);
+}
+
+#[test]
+fn is_null_of_null_comparison() {
+    // (a > 2) is NULL only where a is NULL.
+    let out = evaluate_predicate(&col("a").gt(lit(2_i32)).is_null(), &ints_with_nulls()).unwrap();
+    assert_eq!(
+        out,
+        BooleanArray::from(vec![false, false, true, false, false])
+    );
 }

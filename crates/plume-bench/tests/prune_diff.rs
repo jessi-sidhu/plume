@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, assert_rendered_matches};
 use plume_core::{avg, col, count_star, lit, sum, DataFrame, LogicalPlan};
 use plume_exec::collect;
 use plume_io::scan_parquet_auto;
@@ -34,20 +34,24 @@ fn df(path: &Path) -> DataFrame {
 ///  2. Pruned through plume.collect()
 ///  3. DuckDB via the harness
 fn diff_three_ways_unordered(plan: LogicalPlan, p: &Path, sql: &str) -> Result<()> {
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], false)?;
     let unpruned = collect(&plan)?;
     let pruned_plan = prune_columns(plan)?;
     let pruned = collect(&pruned_plan)?;
     assert_matches_duckdb(&unpruned, sql, &[], &[("sales", p)], false)?;
     assert_matches_duckdb(&pruned, sql, &[], &[("sales", p)], false)?;
+    assert_rendered_matches(&pruned_plan, sql, &[], &[("sales", p)], false)?;
     Ok(())
 }
 
 fn diff_three_ways_ordered(plan: LogicalPlan, p: &Path, sql: &str) -> Result<()> {
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], true)?;
     let unpruned = collect(&plan)?;
     let pruned_plan = prune_columns(plan)?;
     let pruned = collect(&pruned_plan)?;
     assert_matches_duckdb(&unpruned, sql, &[], &[("sales", p)], true)?;
     assert_matches_duckdb(&pruned, sql, &[], &[("sales", p)], true)?;
+    assert_rendered_matches(&pruned_plan, sql, &[], &[("sales", p)], true)?;
     Ok(())
 }
 

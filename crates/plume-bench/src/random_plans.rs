@@ -1110,6 +1110,39 @@ impl Case {
         Ok(Outcome::Pass(cov))
     }
 
+    /// Render the case's plan, unoptimized and optimized, back to SQL with
+    /// [`crate::to_sql::to_sql`], and check DuckDB's result for it the same
+    /// way Plume's result is checked against the hand-written SQL.
+    pub fn check_rendered(&self) -> Result<()> {
+        let conn = crate::harness::reference_connection()?;
+        for (name, path) in &self.tables {
+            conn.execute_batch(&format!(
+                "CREATE VIEW {name} AS SELECT * FROM read_parquet('{}');",
+                path.display()
+            ))?;
+        }
+        let views: Vec<(&str, &Path)> =
+            self.tables.iter().map(|(n, p)| (*n, p.as_path())).collect();
+        let expected = duckdb_query(&self.sql, &[], &views)
+            .with_context(|| format!("seed {}: DuckDB failed on\n{}", self.seed, self.sql))?;
+        let raw = self.df.clone().into_plan();
+        let optimized = Optimizer::default().optimize(raw.clone())?;
+        for (mode, plan) in [("unoptimized", raw), ("optimized", optimized)] {
+            let rendered = crate::harness::run_rendered(&plan)?;
+            self.check
+                .verify(&rendered, &expected, &conn)
+                .with_context(|| {
+                    format!(
+                        "seed {} ({mode}): rendered SQL disagrees with\n{}\nrendered:\n{}",
+                        self.seed,
+                        self.sql,
+                        crate::to_sql::to_sql(&plan).unwrap_or_default()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     /// The case's Parquet files, by table name.
     pub fn tables(&self) -> &[(&'static str, PathBuf)] {
         &self.tables

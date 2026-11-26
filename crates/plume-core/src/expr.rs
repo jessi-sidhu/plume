@@ -242,6 +242,12 @@ pub enum Expr {
         expr: Box<Expr>,
         name: String,
     },
+    /// Logical NOT with three-valued logic: `NOT NULL` is NULL.
+    Not(Box<Expr>),
+    /// `expr IS NULL`. Never NULL itself.
+    IsNull(Box<Expr>),
+    /// `expr IS NOT NULL`. Never NULL itself.
+    IsNotNull(Box<Expr>),
 }
 
 /// One ORDER BY key.
@@ -303,6 +309,17 @@ impl Expr {
                 resolve_aggregate(*fun, &inner)
             }
             Expr::Alias { expr, .. } => expr.data_type(input),
+            Expr::Not(inner) => match inner.data_type(input)? {
+                DataType::Boolean | DataType::Null => Ok(DataType::Boolean),
+                other => Err(PlumeError::Type(format!(
+                    "NOT requires a Boolean operand, got {other:?}"
+                ))),
+            },
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                // Resolve the operand so a missing column still errors.
+                inner.data_type(input)?;
+                Ok(DataType::Boolean)
+            }
         }
     }
 
@@ -325,6 +342,9 @@ impl Expr {
                 _ => format!("{}({})", fun.name(), arg.display_name()),
             },
             Expr::Alias { name, .. } => name.clone(),
+            Expr::Not(inner) => format!("(NOT {})", inner.display_name()),
+            Expr::IsNull(inner) => format!("({} IS NULL)", inner.display_name()),
+            Expr::IsNotNull(inner) => format!("({} IS NOT NULL)", inner.display_name()),
         }
     }
 
@@ -343,6 +363,8 @@ impl Expr {
                 _ => true,
             },
             Expr::Alias { expr, .. } => expr.nullable(input)?,
+            Expr::Not(inner) => inner.nullable(input)?,
+            Expr::IsNull(_) | Expr::IsNotNull(_) => false,
         })
     }
 
@@ -394,6 +416,12 @@ impl Expr {
     pub fn or(self, rhs: Expr) -> Expr {
         binop(self, BinaryOperator::Or, rhs)
     }
+    pub fn is_null(self) -> Expr {
+        Expr::IsNull(Box::new(self))
+    }
+    pub fn is_not_null(self) -> Expr {
+        Expr::IsNotNull(Box::new(self))
+    }
     pub fn plus(self, rhs: Expr) -> Expr {
         binop(self, BinaryOperator::Plus, rhs)
     }
@@ -428,6 +456,10 @@ pub fn col(name: impl Into<String>) -> Expr {
 }
 pub fn lit(v: impl Into<ScalarValue>) -> Expr {
     Expr::Literal(v.into())
+}
+/// `NOT expr`, three-valued: NULL stays NULL.
+pub fn not(e: Expr) -> Expr {
+    Expr::Not(Box::new(e))
 }
 /// `DATE` literal from `YYYY-MM-DD`. Panics on a malformed string, like a
 /// typo in a SQL literal; use `ScalarValue::date32_from_str` to handle the
@@ -598,9 +630,24 @@ pub fn conjuncts(e: &Expr) -> Vec<&Expr> {
 }
 
 /// Rewrite a single comparison into `column OP literal` form (flipping
-/// `literal OP column`). Returns None for anything else, including NULL
-/// literals. This is the shape the scan can use for row-group pruning.
+/// `literal OP column`), or pass `column IS [NOT] NULL` through. Returns
+/// None for anything else, including NULL literals and `NOT`. This is the
+/// shape the scan can use for row-group pruning.
 pub fn normalize_pushable(e: &Expr) -> Option<Expr> {
+    // `col IS [NOT] NULL` prunes from the null count alone.
+    match e {
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            let Expr::Column(name) = strip_alias(inner) else {
+                return None;
+            };
+            let column = Box::new(Expr::Column(name.clone()));
+            return Some(match e {
+                Expr::IsNull(_) => Expr::IsNull(column),
+                _ => Expr::IsNotNull(column),
+            });
+        }
+        _ => {}
+    }
     let Expr::BinaryOp { left, op, right } = e else {
         return None;
     };

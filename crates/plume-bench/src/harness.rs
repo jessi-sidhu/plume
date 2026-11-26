@@ -22,6 +22,9 @@ use arrow_schema::Schema;
 use arrow_schema::{DataType, TimeUnit};
 use duckdb::Connection;
 use parquet::arrow::ArrowWriter;
+use plume_core::LogicalPlan;
+
+use crate::to_sql::to_sql;
 
 /// Pretty-print a value at row `i` of an Arrow array, using the marker
 /// `<NULL>` for null cells. Kept narrow on purpose — extend as new types
@@ -147,6 +150,39 @@ pub fn duckdb_query(
     let mut stmt = conn.prepare(sql).context("prepare sql")?;
     let batches: Vec<RecordBatch> = stmt.query_arrow([]).context("execute sql")?.collect();
     Ok(batches)
+}
+
+/// Render `plan` with [`to_sql`] and run it in DuckDB. Scans in the
+/// rendered SQL read their files directly, so nothing needs registering.
+/// Diff tests check this result the same way they check Plume's, which
+/// proves the renderer against their hand-written SQL.
+pub fn run_rendered(plan: &LogicalPlan) -> Result<Vec<RecordBatch>> {
+    let sql = to_sql(plan)?;
+    duckdb_query(&sql, &[], &[]).with_context(|| format!("running rendered SQL: {sql}"))
+}
+
+/// [`run_rendered`], then check it matches the hand-written `sql`.
+pub fn assert_rendered_matches(
+    plan: &LogicalPlan,
+    sql: &str,
+    register_csvs: &[(&str, &Path)],
+    register_parquets: &[(&str, &Path)],
+    order_sensitive: bool,
+) -> Result<()> {
+    let rendered = run_rendered(plan)?;
+    assert_matches_duckdb(
+        &rendered,
+        sql,
+        register_csvs,
+        register_parquets,
+        order_sensitive,
+    )
+    .with_context(|| {
+        format!(
+            "rendered SQL disagrees: {}",
+            to_sql(plan).unwrap_or_default()
+        )
+    })
 }
 
 /// Diff `actual` (whatever plume produced) against the result DuckDB returns

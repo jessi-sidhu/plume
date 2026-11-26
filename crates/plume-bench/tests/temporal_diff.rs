@@ -20,7 +20,7 @@ use arrow_array::{Date32Array, Int64Array, RecordBatch, TimestampMicrosecondArra
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, run_rendered};
 use plume_core::{col, lit_date, lit_timestamp, Expr, ScalarValue};
 use plume_exec::{collect, collect_with_metrics};
 use plume_io::scan_parquet_auto;
@@ -112,10 +112,12 @@ fn check(path: &Path, filter: Expr, where_sql: &str) -> Result<u64> {
 
     let plain = collect(&plan)?;
     assert_matches_duckdb(&plain, &sql, &[], &[("t", path)], false)?;
+    assert_matches_duckdb(&run_rendered(&plan)?, &sql, &[], &[("t", path)], false)?;
 
     let optimized = Optimizer::default().optimize(plan)?;
     let (batches, metrics) = collect_with_metrics(&optimized)?;
     assert_matches_duckdb(&batches, &sql, &[], &[("t", path)], false)?;
+    assert_matches_duckdb(&run_rendered(&optimized)?, &sql, &[], &[("t", path)], false)?;
 
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].row_groups_total, 4);

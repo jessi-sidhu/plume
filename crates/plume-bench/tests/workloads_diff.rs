@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, run_rendered};
 use plume_bench::workloads::{self, Dataset, Tables, LAYOUTS};
 use plume_exec::collect;
 use plume_optimizer::Optimizer;
@@ -55,6 +55,14 @@ fn check_dataset(dataset: Dataset) -> Result<()> {
                 assert_matches_duckdb(&batches, &q.sql, &[], &tables.duckdb_views(), false)
                     .with_context(|| format!("{} {layout} {mode}", q.name))?;
             }
+            assert_matches_duckdb(
+                &run_rendered(&plan)?,
+                &q.sql,
+                &[],
+                &tables.duckdb_views(),
+                false,
+            )
+            .with_context(|| format!("{} {layout} rendered SQL", q.name))?;
             eprintln!("ok {} {layout}", q.name);
         }
     }

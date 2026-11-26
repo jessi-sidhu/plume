@@ -17,7 +17,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use plume_bench::harness::{assert_valid_sorted_result, duckdb_query};
+use plume_bench::harness::{assert_valid_sorted_result, duckdb_query, run_rendered};
 use plume_core::{col, count_star, lit, DataFrame, LogicalPlan};
 use plume_exec::{collect_with_options, PlannerOptions, ScanMetricsSnapshot};
 use plume_io::scan_parquet_auto;
@@ -70,6 +70,7 @@ fn check(
     let all = duckdb_query(all_sql, &[], &tables)?;
     assert_valid_sorted_result(&on, &expected, keys, &all)?;
     assert_valid_sorted_result(&off, &expected, keys, &all)?;
+    assert_valid_sorted_result(&run_rendered(&plan)?, &expected, keys, &all)?;
     assert_eq!(m_off.row_groups_pruned_topk, 0);
     Ok((on, m_on, m_off))
 }

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use plume_core::{col, lit, DataFrame, JoinType, LogicalPlan};
+use plume_core::{col, lit, not, DataFrame, JoinType, LogicalPlan};
 use plume_optimizer::{optimize, pushdown_predicates};
 
 fn customers_schema() -> Arc<Schema> {
@@ -584,4 +584,88 @@ fn filter_predicates_helper_smoke() {
         .into_plan();
     let preds = filter_predicates(&plan);
     assert_eq!(preds, vec!["(region = \"west\")"]);
+}
+
+// ---- NOT / IS NULL follow the same per-join-type rules ----------------
+
+fn joined(kind: JoinType) -> DataFrame {
+    customers()
+        .join(orders(), vec![(col("id"), col("customer_id"))], kind)
+        .unwrap()
+}
+
+#[test]
+fn left_join_keeps_right_side_is_null_above() {
+    // `amount IS NULL` above a LEFT join is the anti-join idiom: it is TRUE
+    // exactly on the NULL-padded rows. Pushing it into the right side would
+    // drop every real order and change the answer.
+    let plan = joined(JoinType::Left)
+        .filter(col("amount").is_null())
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    assert!(
+        filter_predicates_above_join(&optimized)
+            .iter()
+            .any(|p| p == "(amount IS NULL)"),
+        "IS NULL on the right side must stay above a LEFT join:\n{}",
+        optimized.explain()
+    );
+    assert!(!contains_filter(
+        right_subtree(&optimized),
+        "(amount IS NULL)"
+    ));
+}
+
+#[test]
+fn left_join_keeps_right_side_not_above() {
+    let plan = joined(JoinType::Left)
+        .filter(not(col("amount").gt(lit(100.0_f64))))
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    assert!(!contains_filter(
+        right_subtree(&optimized),
+        "(NOT (amount > 100))"
+    ));
+    assert!(!filter_predicates_above_join(&optimized).is_empty());
+}
+
+#[test]
+fn left_join_pushes_left_side_null_check_and_not() {
+    let plan = joined(JoinType::Left)
+        .filter(
+            col("name")
+                .is_not_null()
+                .and(not(col("region").eq(lit("west")))),
+        )
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    assert!(filter_predicates_above_join(&optimized).is_empty());
+    let left = left_subtree(&optimized);
+    // Both conjuncts land on the left side as one Filter.
+    assert!(
+        contains_filter(left, "((name IS NOT NULL) AND (NOT (region = \"west\")))"),
+        "{}",
+        left.explain()
+    );
+}
+
+#[test]
+fn inner_join_pushes_null_checks_to_each_side() {
+    let plan = joined(JoinType::Inner)
+        .filter(col("name").is_not_null().and(col("amount").is_null()))
+        .unwrap()
+        .into_plan();
+    let optimized = pushdown_predicates(plan).unwrap();
+    assert!(filter_predicates_above_join(&optimized).is_empty());
+    assert!(contains_filter(
+        left_subtree(&optimized),
+        "(name IS NOT NULL)"
+    ));
+    assert!(contains_filter(
+        right_subtree(&optimized),
+        "(amount IS NULL)"
+    ));
 }

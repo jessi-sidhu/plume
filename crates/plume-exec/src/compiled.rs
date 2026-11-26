@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use arrow::compute::kernels::{boolean, cmp, numeric};
+use arrow::compute::{is_not_null, is_null};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
@@ -31,7 +32,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Schema, TimeUnit};
 use plume_core::{BinaryOperator, Expr, ScalarValue};
 
-use crate::eval::{EvalError, EvalResult};
+use crate::eval::{apply_not, EvalError, EvalResult};
 
 /// `DataType` for `ScalarValue::TimestampMicros`, as a static so
 /// `CompiledExpr::data_type` can hand out a reference.
@@ -52,6 +53,9 @@ pub enum CompiledExpr {
         op: BinaryOperator,
         right: Box<CompiledExpr>,
     },
+    Not(Box<CompiledExpr>),
+    IsNull(Box<CompiledExpr>),
+    IsNotNull(Box<CompiledExpr>),
 }
 
 impl CompiledExpr {
@@ -73,6 +77,9 @@ impl CompiledExpr {
             // this, so leave it for the caller via Expr::data_type when
             // they really need it.
             CompiledExpr::BinaryOp { .. } => &DataType::Null,
+            CompiledExpr::Not(_) | CompiledExpr::IsNull(_) | CompiledExpr::IsNotNull(_) => {
+                &DataType::Boolean
+            }
         }
     }
 
@@ -85,6 +92,11 @@ impl CompiledExpr {
                 let l = left.evaluate(batch)?;
                 let r = right.evaluate(batch)?;
                 apply_binary(*op, &l, &r)
+            }
+            CompiledExpr::Not(inner) => apply_not(&inner.evaluate(batch)?),
+            CompiledExpr::IsNull(inner) => Ok(Arc::new(is_null(inner.evaluate(batch)?.as_ref())?)),
+            CompiledExpr::IsNotNull(inner) => {
+                Ok(Arc::new(is_not_null(inner.evaluate(batch)?.as_ref())?))
             }
         }
     }
@@ -126,6 +138,15 @@ pub fn compile(expr: &Expr, input_schema: &Schema) -> EvalResult<CompiledExpr> {
         Expr::Aggregate { .. } => Err(EvalError::AggregateInScalarContext),
         // Alias is cosmetic — strip and recurse.
         Expr::Alias { expr, .. } => compile(expr, input_schema),
+        Expr::Not(inner) => Ok(CompiledExpr::Not(Box::new(compile(inner, input_schema)?))),
+        Expr::IsNull(inner) => Ok(CompiledExpr::IsNull(Box::new(compile(
+            inner,
+            input_schema,
+        )?))),
+        Expr::IsNotNull(inner) => Ok(CompiledExpr::IsNotNull(Box::new(compile(
+            inner,
+            input_schema,
+        )?))),
     }
 }
 

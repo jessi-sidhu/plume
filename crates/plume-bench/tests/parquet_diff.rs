@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use plume_bench::harness::assert_matches_duckdb;
+use plume_bench::harness::{assert_matches_duckdb, assert_rendered_matches};
 use plume_core::{avg, col, count_star, lit, max, min, sum, DataFrame};
 use plume_exec::collect;
 use plume_io::scan_parquet_auto;
@@ -29,12 +29,16 @@ fn df(path: &Path) -> DataFrame {
 }
 
 fn diff_ordered(plan: DataFrame, p: &Path, sql: &str) -> Result<()> {
-    let actual = collect(&plan.into_plan())?;
+    let plan = plan.into_plan();
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], true)?;
+    let actual = collect(&plan)?;
     assert_matches_duckdb(&actual, sql, &[], &[("sales", p)], true)
 }
 
 fn diff_unordered(plan: DataFrame, p: &Path, sql: &str) -> Result<()> {
-    let actual = collect(&plan.into_plan())?;
+    let plan = plan.into_plan();
+    assert_rendered_matches(&plan, sql, &[], &[("sales", p)], false)?;
+    let actual = collect(&plan)?;
     assert_matches_duckdb(&actual, sql, &[], &[("sales", p)], false)
 }
 

@@ -6,7 +6,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use plume_core::{col, lit};
+use plume_core::{col, lit, not};
 use plume_exec::{compile, EvalError};
 
 fn batch() -> RecordBatch {
@@ -95,4 +95,22 @@ fn literal_broadcasts_to_batch_length() {
     assert_eq!(arr.len(), b.num_rows());
     assert_eq!(arr.as_primitive::<Int32Type>().value(0), 42);
     assert_eq!(arr.as_primitive::<Int32Type>().value(4), 42);
+}
+
+#[test]
+fn compiled_not_and_null_checks_match_interpreter() {
+    let b = batch();
+    let exprs = [
+        not(col("a").gt(lit(2_i32))),
+        col("a").is_null(),
+        col("a").is_not_null(),
+        not(col("a").is_null()),
+    ];
+    for e in exprs {
+        let c = compile(&e, b.schema().as_ref()).unwrap();
+        assert_eq!(c.data_type(), &DataType::Boolean, "{}", e.display_name());
+        let got = c.evaluate(&b).unwrap();
+        let want = plume_exec::evaluate(&e, &b).unwrap();
+        assert_eq!(got.as_boolean(), want.as_boolean(), "{}", e.display_name());
+    }
 }

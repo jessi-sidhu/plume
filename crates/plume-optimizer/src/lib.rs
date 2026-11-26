@@ -349,6 +349,9 @@ fn collect_columns(e: &Expr, out: &mut HashSet<String>) {
         }
         Expr::Aggregate { arg, .. } => collect_columns(arg, out),
         Expr::Alias { expr, .. } => collect_columns(expr, out),
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_columns(inner, out)
+        }
     }
 }
 
@@ -690,6 +693,21 @@ fn fold_expr(e: Expr) -> Expr {
         Expr::Alias { expr, name } => Expr::Alias {
             expr: Box::new(fold_expr(*expr)),
             name,
+        },
+        // NOT of a known boolean flips it. NOT NULL is left alone: folding
+        // it to a bare NULL literal would lose the Boolean type.
+        Expr::Not(inner) => match fold_expr(*inner) {
+            Expr::Literal(ScalarValue::Boolean(b)) => Expr::Literal(ScalarValue::Boolean(!b)),
+            other => Expr::Not(Box::new(other)),
+        },
+        // IS [NOT] NULL of a literal is known at plan time and never NULL.
+        Expr::IsNull(inner) => match fold_expr(*inner) {
+            Expr::Literal(v) => Expr::Literal(ScalarValue::Boolean(v == ScalarValue::Null)),
+            other => Expr::IsNull(Box::new(other)),
+        },
+        Expr::IsNotNull(inner) => match fold_expr(*inner) {
+            Expr::Literal(v) => Expr::Literal(ScalarValue::Boolean(v != ScalarValue::Null)),
+            other => Expr::IsNotNull(Box::new(other)),
         },
         leaf => leaf,
     }
